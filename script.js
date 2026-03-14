@@ -159,7 +159,8 @@
       if (!raw) return [];
       const data = JSON.parse(raw);
       if (!Array.isArray(data)) return [];
-      return data.filter(item => item && typeof item.id === 'string' && typeof item.action === 'string' && typeof item.at === 'string');
+      const filtered = data.filter(item => item && typeof item.id === 'string' && typeof item.action === 'string' && typeof item.at === 'string');
+      return filtered.sort((a, b) => new Date(b.at) - new Date(a.at));
     } catch (e) {
       console.warn('Failed to parse history store', e);
       return [];
@@ -186,7 +187,7 @@
       promptId: event.promptId || null,
       title: event.title || 'Untitled',
       model: event.model || 'unknown',
-      at: new Date().toISOString(),
+      at: event.at || new Date().toISOString(),
       details: event.details || ''
     });
     if (history.length > MAX_HISTORY_ITEMS) history.length = MAX_HISTORY_ITEMS;
@@ -194,16 +195,49 @@
     renderHistory(history);
   }
 
+  function reconcileHistoryWithPrompts(prompts) {
+    const history = loadHistory();
+    const savedPromptIds = new Set(
+      history
+        .filter(item => item.action === 'save' && typeof item.promptId === 'string')
+        .map(item => item.promptId)
+    );
+
+    let changed = false;
+    for (const prompt of prompts) {
+      if (!prompt || typeof prompt.id !== 'string') continue;
+      if (savedPromptIds.has(prompt.id)) continue;
+      history.push({
+        id: createHistoryId(),
+        action: 'save',
+        promptId: prompt.id,
+        title: prompt.title || 'Untitled',
+        model: prompt?.metadata?.model || 'unknown',
+        at: prompt?.metadata?.createdAt || new Date().toISOString(),
+        details: 'Recovered from existing saved prompts'
+      });
+      changed = true;
+    }
+
+    if (changed) {
+      history.sort((a, b) => new Date(b.at) - new Date(a.at));
+      if (history.length > MAX_HISTORY_ITEMS) history.length = MAX_HISTORY_ITEMS;
+      saveHistory(history);
+    }
+    return history;
+  }
+
   function renderHistory(history) {
     if (!historyListEl || !historyEmptyEl) return;
+    const sortedHistory = [...history].sort((a, b) => new Date(b.at) - new Date(a.at));
     historyListEl.innerHTML = '';
-    if (!history.length) {
+    if (!sortedHistory.length) {
       historyEmptyEl.hidden = false;
       return;
     }
     historyEmptyEl.hidden = true;
     const frag = document.createDocumentFragment();
-    history.forEach(item => {
+    sortedHistory.forEach(item => {
       const li = document.createElement('li');
       li.className = 'history-item';
       li.dataset.action = item.action;
@@ -432,8 +466,9 @@
         renderHistory([]);
       });
     }
-    render(loadPrompts());
-    renderHistory(loadHistory());
+    const prompts = loadPrompts();
+    render(prompts);
+    renderHistory(reconcileHistoryWithPrompts(prompts));
     setActiveTab('saved');
     updateModelInputState();
     setupImportExport();
@@ -850,16 +885,14 @@
   window.__promptMeta = { trackModel, updateTimestamps, estimateTokens };
 
   /* ================= Export / Import System ================= */
-  /** Schema Version for exported file */
-  const EXPORT_SCHEMA_VERSION = 1;
-  /** Names inserted in exported JSON */
+  const EXPORT_SCHEMA_VERSION = 2;
   const EXPORT_FILE_BASENAME = 'prompt-library-export';
 
   /** Compute statistics from prompts */
   function computeStats(prompts) {
     const total = prompts.length;
     const ratings = prompts.map(p => typeof p.userRating === 'number' ? p.userRating : null).filter(Boolean);
-    const averageRating = ratings.length ? (ratings.reduce((a,b)=>a+b,0) / ratings.length) : null;
+    const averageRating = ratings.length ? Number((ratings.reduce((a,b)=>a+b,0) / ratings.length).toFixed(2)) : null;
     // most used model
     const modelCounts = {};
     for (const p of prompts) {
@@ -881,26 +914,27 @@
     try { validateMetadata(p.metadata); } catch (e) { throw new Error('Metadata invalid for prompt '+p.id+': '+e.message); }
   }
 
-  /** Build export JSON object */
+  function assertPromptIdsUnique(prompts) {
+    const seen = new Set();
+    for (const p of prompts) {
+      if (seen.has(p.id)) throw new Error(`Duplicate prompt id found in import file: ${p.id}`);
+      seen.add(p.id);
+    }
+  }
+
   function buildExportPayload() {
     const prompts = loadPrompts();
-    const notesStore = loadNotesStore();
-    const stats = computeStats(prompts);
-    const payload = {
-      type: 'prompt-library-backup',
-      schemaVersion: EXPORT_SCHEMA_VERSION,
-      exportedAt: new Date().toISOString(),
-      application: 'Prompt Library',
-      meta: {
-        stats,
-        storageKeys: { prompts: STORAGE_KEY, notes: NOTES_KEY },
-        sourceUrl: location.href.split('#')[0]
-      },
-      data: { prompts, notes: notesStore }
-    };
-    // Final validation of all prompts
     prompts.forEach(validatePromptRecord);
-    return payload;
+
+    const stats = computeStats(prompts);
+
+    return {
+      type: 'prompt-library-export',
+      version: EXPORT_SCHEMA_VERSION,
+      exportedAt: new Date().toISOString(),
+      stats,
+      prompts
+    };
   }
 
   function triggerDownload(obj) {
@@ -919,107 +953,74 @@
     try {
       const payload = buildExportPayload();
       triggerDownload(payload);
-      showIEMessage('Export completed.', 'success');
+      showIEMessage(`Export completed: ${payload.prompts.length} prompt(s).`, 'success');
     } catch (e) {
       console.error(e);
       showIEMessage('Export failed: '+(e.message||e), 'error');
     }
   }
 
-  /** Parse and validate imported JSON structure */
   function parseImportFile(text) {
     let data;
-    try { data = JSON.parse(text); } catch (e) { throw new Error('File is not valid JSON.'); }
-    // Accept three shapes:
-    // 1. Current schema: { type:'prompt-library-backup', schemaVersion, data:{prompts,notes} }
-    // 2. Legacy object: { prompts:[...], notes:{...} } (no type/schemaVersion)
-    // 3. Bare array: [ {id,title,content,metadata?}, ... ]
-    if (Array.isArray(data)) {
-      // Bare array fallback
-      const prompts = data.map(hydrateLegacyPrompt);
-      prompts.forEach(validatePromptRecord);
-      return { prompts, notes: {}, raw: { legacy: true, origin: 'array' } };
-    }
-    if (!data || typeof data !== 'object') throw new Error('Root not an object');
-
-    const typeVal = typeof data.type === 'string' ? data.type.toLowerCase() : null;
-    const isModern = typeVal === 'prompt-library-backup';
-    const looksLegacyObject = !isModern && (Array.isArray(data.prompts) || Array.isArray(data.data)) && (data.notes || data.prompts || data.data);
-
-    if (!isModern && !looksLegacyObject) {
-      throw new Error('Unsupported file type');
-    }
-
-    if (isModern) {
-      if (typeof data.schemaVersion !== 'number') throw new Error('Missing schemaVersion');
-      if (data.schemaVersion > EXPORT_SCHEMA_VERSION) throw new Error('Export file version is newer ('+data.schemaVersion+'), update app.');
-      const prompts = data?.data?.prompts;
-      const notes = data?.data?.notes || {};
-      if (!Array.isArray(prompts)) throw new Error('data.prompts must be an array');
-      prompts.forEach(validatePromptRecord);
-      if (typeof notes !== 'object') throw new Error('data.notes must be object');
-      return { prompts, notes, raw: data };
-    }
-
-    // Legacy object path
-    const promptsArr = Array.isArray(data.prompts) ? data.prompts : (Array.isArray(data.data) ? data.data : []);
-    const legacyNotes = data.notes && typeof data.notes === 'object' ? data.notes : {};
-    const prompts = promptsArr.map(hydrateLegacyPrompt);
-    prompts.forEach(validatePromptRecord);
-    return { prompts, notes: legacyNotes, raw: { legacy: true, origin: 'object' } };
-  }
-
-  /** Merge strategy ask user: replace or merge (with conflict resolution) */
-  function mergePrompts(existing, incoming) {
-    const map = new Map(existing.map(p => [p.id, p]));
-    const conflicts = [];
-    for (const p of incoming) {
-      if (map.has(p.id)) conflicts.push(p.id);
-    }
-    if (conflicts.length) {
-      const strategy = askConflictStrategy(conflicts.length);
-      if (!strategy) throw new Error('Import cancelled by user');
-      if (strategy === 'replace') {
-        // Replace conflicting prompts with incoming versions
-        for (const p of incoming) map.set(p.id, p);
-      } else if (strategy === 'skip') {
-        for (const p of incoming) {
-          if (!map.has(p.id)) map.set(p.id, p);
-        }
-      } else if (strategy === 'keepBoth') {
-        for (const p of incoming) {
-          if (map.has(p.id)) {
-            // generate new id
-            const newId = createId();
-            const clone = { ...p, id: newId };
-            map.set(clone.id, clone);
-          } else {
-            map.set(p.id, p);
-          }
-        }
-      }
-    } else {
-      // simple append
-      for (const p of incoming) map.set(p.id, p);
-    }
-    return Array.from(map.values()).sort((a,b) => new Date(b.metadata?.createdAt||0) - new Date(a.metadata?.createdAt||0));
-  }
-
-  function askConflictStrategy(conflictCount) {
-    // Use confirm dialogs for simplicity; could be replaced with custom modal UI
-    // Order: Replace All -> Skip Duplicates -> Keep Both
-    if (!window.confirm(`${conflictCount} duplicate ID(s) found. Proceed to choose resolution?`)) return null;
-    if (window.confirm('Click OK to REPLACE duplicates with incoming versions. Cancel to choose another option.')) return 'replace';
-    if (window.confirm('Click OK to SKIP incoming duplicates. Cancel to keep both.')) return 'skip';
-    return 'keepBoth';
-  }
-
-  /** Backup existing data before import */
-  function backupCurrentData() {
-    const payload = buildExportPayload();
     try {
-      localStorage.setItem(STORAGE_KEY + '.backup', JSON.stringify(payload.data.prompts));
-      localStorage.setItem(NOTES_KEY + '.backup', JSON.stringify(payload.data.notes));
+      data = JSON.parse(text);
+    } catch {
+      throw new Error('Invalid JSON file.');
+    }
+
+    if (!data || typeof data !== 'object') throw new Error('Import root must be an object.');
+
+    // Support current schema and older variants.
+    const version = Number(data.version ?? data.schemaVersion ?? 1);
+    if (!Number.isFinite(version)) throw new Error('Missing or invalid export version.');
+    if (version > EXPORT_SCHEMA_VERSION) {
+      throw new Error(`Import version ${version} is newer than supported version ${EXPORT_SCHEMA_VERSION}.`);
+    }
+
+    let prompts = [];
+    if (Array.isArray(data.prompts)) prompts = data.prompts;
+    else if (Array.isArray(data?.data?.prompts)) prompts = data.data.prompts;
+    else if (Array.isArray(data.data)) prompts = data.data;
+    else if (Array.isArray(data)) prompts = data;
+    else throw new Error('Missing prompts array in import file.');
+
+    const hydrated = prompts.map(hydrateLegacyPrompt);
+    hydrated.forEach(validatePromptRecord);
+    assertPromptIdsUnique(hydrated);
+
+    return { prompts: hydrated, version };
+  }
+
+  function mergePrompts(existing, incoming, overwriteConflicts) {
+    const map = new Map(existing.map(p => [p.id, p]));
+    let duplicateCount = 0;
+
+    for (const p of incoming) {
+      if (map.has(p.id)) {
+        duplicateCount += 1;
+        if (overwriteConflicts) map.set(p.id, p);
+      } else {
+        map.set(p.id, p);
+      }
+    }
+
+    return {
+      prompts: Array.from(map.values()).sort((a,b) => new Date(b.metadata?.createdAt||0) - new Date(a.metadata?.createdAt||0)),
+      duplicateCount
+    };
+  }
+
+  function chooseImportMode(incomingCount, duplicateCount) {
+    const replace = window.confirm(
+      `Import file contains ${incomingCount} prompt(s)${duplicateCount ? ` with ${duplicateCount} duplicate id(s).` : '.'}\n\n` +
+      'Click OK to REPLACE all existing prompts.\nClick Cancel to MERGE with existing prompts.'
+    );
+    return replace ? 'replace' : 'merge';
+  }
+
+  function backupCurrentData() {
+    try {
+      localStorage.setItem(STORAGE_KEY + '.backup', localStorage.getItem(STORAGE_KEY) || '[]');
     } catch (e) {
       console.warn('Failed to persist backup', e);
     }
@@ -1028,9 +1029,7 @@
   function rollbackFromBackup() {
     try {
       const p = localStorage.getItem(STORAGE_KEY + '.backup');
-      const n = localStorage.getItem(NOTES_KEY + '.backup');
       if (p) localStorage.setItem(STORAGE_KEY, p);
-      if (n) localStorage.setItem(NOTES_KEY, n);
     } catch (e) {
       console.error('Rollback failed', e);
     }
@@ -1041,38 +1040,47 @@
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        backupCurrentData();
-        const { prompts: incomingPrompts, notes: incomingNotes } = parseImportFile(String(reader.result));
         const existingPrompts = loadPrompts();
-        const mergedPrompts = mergePrompts(existingPrompts, incomingPrompts);
-        // merge notes: union by promptId then note id (simple strategy)
-        const currentNotes = loadNotesStore();
-        const finalNotes = { ...currentNotes };
-        for (const [pid, arr] of Object.entries(incomingNotes)) {
-          if (!Array.isArray(arr)) continue;
-          if (!Array.isArray(finalNotes[pid])) finalNotes[pid] = [];
-          const noteIds = new Set(finalNotes[pid].map(n => n.id));
-            for (const n of arr) {
-              if (!n || typeof n.id !== 'string') continue;
-              if (noteIds.has(n.id)) continue; // skip duplicates
-              finalNotes[pid].push(n);
-            }
+        backupCurrentData();
+
+        const { prompts: incomingPrompts } = parseImportFile(String(reader.result));
+        const existingIds = new Set(existingPrompts.map(p => p.id));
+        let duplicateCount = 0;
+        for (const p of incomingPrompts) {
+          if (existingIds.has(p.id)) duplicateCount += 1;
         }
-        savePrompts(mergedPrompts);
-        saveNotesStore(finalNotes);
+
+        const mode = chooseImportMode(incomingPrompts.length, duplicateCount);
+
+        let finalPrompts = incomingPrompts;
+        let importDetails = '';
+
+        if (mode === 'merge') {
+          const overwriteConflicts = duplicateCount
+            ? window.confirm('Merge mode: overwrite duplicates with imported prompts?\nOK = overwrite duplicates, Cancel = keep existing duplicates.')
+            : false;
+          const merged = mergePrompts(existingPrompts, incomingPrompts, overwriteConflicts);
+          finalPrompts = merged.prompts;
+          importDetails = `mode=merge, duplicates=${merged.duplicateCount}, overwrite=${overwriteConflicts}`;
+        } else {
+          importDetails = 'mode=replace';
+        }
+
+        savePrompts(finalPrompts);
         appendHistoryEvent({
           action: 'import',
           title: 'Import completed',
           model: 'mixed',
-          details: `${incomingPrompts.length} prompt(s) imported`
+          details: `${incomingPrompts.length} prompt(s) imported, ${importDetails}`
         });
-        render(mergedPrompts);
-        showIEMessage(`Import successful. Added ${incomingPrompts.length} prompt(s).`, 'success');
+
+        render(finalPrompts);
+        showIEMessage(`Import successful (${mode}). Loaded ${incomingPrompts.length} prompt(s).`, 'success');
       } catch (e) {
         console.error('Import error', e);
         rollbackFromBackup();
         render(loadPrompts());
-        showIEMessage('Import failed: '+(e.message||e), 'error');
+        showIEMessage('Import failed and was rolled back: ' + (e.message || e), 'error');
       }
     };
     reader.onerror = () => {
