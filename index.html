@@ -8,11 +8,24 @@
 </head>
 <body>
   <header class="app-header">
-    <h1>Prompt Library</h1>
-    <div class="header-tools" role="region" aria-label="Data tools">
-      <button type="button" id="export-btn" class="tool-btn" aria-label="Export prompts">Export</button>
-      <button type="button" id="import-btn" class="tool-btn" aria-label="Import prompts">Import</button>
-      <input type="file" id="import-file" accept="application/json" hidden aria-hidden="true" />
+    <div class="app-header-inner">
+      <div class="header-copy-block">
+        <p class="eyebrow">Local Prompt Atelier</p>
+        <h1>Prompt Library</h1>
+        <p class="header-copy">Curate reusable prompts, keep research notes close to the source, and review the timeline of how your library evolves without leaving the browser.</p>
+      </div>
+      <div class="header-actions">
+        <div class="header-badges" aria-label="Application characteristics">
+          <span class="header-badge">Local First</span>
+          <span class="header-badge">Versioned Export</span>
+          <span class="header-badge">Metadata Aware</span>
+        </div>
+        <div class="header-tools" role="region" aria-label="Data tools">
+          <button type="button" id="export-btn" class="tool-btn" aria-label="Export prompts">Export</button>
+          <button type="button" id="import-btn" class="tool-btn" aria-label="Import prompts">Import</button>
+          <input type="file" id="import-file" accept="application/json" hidden aria-hidden="true" />
+        </div>
+      </div>
     </div>
   </header>
 
@@ -66,6 +79,20 @@
       </div>
       <div id="import-export-messages" class="iemessages" role="alert" aria-live="polite" hidden></div>
       <div id="panel-saved" class="tab-panel" role="tabpanel" aria-labelledby="tab-saved">
+        <div class="library-toolbar" aria-label="Prompt filters">
+          <div class="search-shell">
+            <label class="search-label" for="search-input">Search</label>
+            <input type="search" id="search-input" placeholder="Search titles, prompt content, notes, or models" autocomplete="off" />
+          </div>
+          <div class="filter-shell">
+            <label class="search-label" for="filter-model-select">Model</label>
+            <select id="filter-model-select">
+              <option value="">All models</option>
+            </select>
+          </div>
+          <button type="button" id="clear-filters-btn" class="secondary-btn">Clear filters</button>
+        </div>
+        <p id="filter-summary" class="filter-summary" aria-live="polite">Showing all prompts.</p>
         <div id="prompts-empty" class="empty-state" hidden>
           <p>No prompts saved yet. Add your first one!</p>
         </div>
@@ -101,6 +128,39 @@
   </template>
 
   <footer class="app-footer">Local-only storage. Clearing browser data will remove prompts.</footer>
+
+  <dialog id="import-modal" class="import-modal" aria-labelledby="import-modal-title">
+    <form method="dialog" id="import-modal-form" class="import-modal-panel">
+      <div class="import-modal-header">
+        <h2 id="import-modal-title">Import library data</h2>
+        <p id="import-modal-copy" class="import-modal-copy">Choose how the incoming file should be applied to your local library.</p>
+      </div>
+      <fieldset class="import-fieldset">
+        <legend>Import mode</legend>
+        <label class="choice-card" for="import-mode-replace">
+          <input type="radio" id="import-mode-replace" name="import-mode" value="replace" checked />
+          <span class="choice-title">Replace local library</span>
+          <span class="choice-copy">Overwrite prompts, notes, and history with the imported file.</span>
+        </label>
+        <label class="choice-card" for="import-mode-merge">
+          <input type="radio" id="import-mode-merge" name="import-mode" value="merge" />
+          <span class="choice-title">Merge into local library</span>
+          <span class="choice-copy">Keep local items and merge matching prompt IDs using your chosen duplicate policy.</span>
+        </label>
+      </fieldset>
+      <div id="duplicate-options" class="duplicate-options" hidden>
+        <label for="duplicate-handling-select">When duplicate prompt IDs exist</label>
+        <select id="duplicate-handling-select">
+          <option value="overwrite">Use imported records</option>
+          <option value="keep">Keep local records</option>
+        </select>
+      </div>
+      <div class="import-modal-actions">
+        <button type="button" id="import-cancel-btn" class="secondary-btn">Cancel</button>
+        <button type="submit" id="import-confirm-btn">Continue import</button>
+      </div>
+    </form>
+  </dialog>
 
   <script src="script.js"></script>
 </body>

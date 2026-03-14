@@ -1,8 +1,30 @@
 (function() {
   const STORAGE_KEY = 'promptLibrary.items.v1';
-  const NOTES_KEY = 'promptNotes.v1'; // localStorage key for notes
+  const NOTES_KEY = 'promptNotes.v1';
   const HISTORY_KEY = 'promptHistory.v1';
+  const BACKUP_SUFFIX = '.backup';
+
   const MAX_HISTORY_ITEMS = 500;
+  const MAX_IMPORT_FILE_SIZE_BYTES = 1024 * 1024;
+  const MAX_IMPORT_PROMPTS = 1000;
+  const MAX_IMPORT_NOTES = 5000;
+  const MAX_NOTE_CONTENT_LENGTH = 2000;
+  const MAX_HISTORY_DETAIL_LENGTH = 240;
+  const EXPORT_SCHEMA_VERSION = 3;
+  const EXPORT_FILE_BASENAME = 'prompt-library-export';
+  const VALID_HISTORY_ACTIONS = new Set(['save', 'delete', 'import']);
+  const MAX_STARS = 5;
+
+  const state = {
+    prompts: null,
+    notes: null,
+    history: null,
+    searchQuery: '',
+    modelFilter: '',
+    renderFrame: 0,
+    importDecisionResolver: null,
+    importDecisionContext: null
+  };
 
   const form = document.getElementById('prompt-form');
   const titleInput = document.getElementById('prompt-title');
@@ -21,241 +43,337 @@
   const historyListEl = document.getElementById('history-list');
   const historyEmptyEl = document.getElementById('history-empty');
   const clearHistoryBtn = document.getElementById('clear-history-btn');
+  const searchInput = document.getElementById('search-input');
+  const filterModelSelect = document.getElementById('filter-model-select');
+  const clearFiltersBtn = document.getElementById('clear-filters-btn');
+  const filterSummaryEl = document.getElementById('filter-summary');
+  const importModal = document.getElementById('import-modal');
+  const importModalForm = document.getElementById('import-modal-form');
+  const importModalCopy = document.getElementById('import-modal-copy');
+  const importModeReplace = document.getElementById('import-mode-replace');
+  const importModeMerge = document.getElementById('import-mode-merge');
+  const duplicateOptions = document.getElementById('duplicate-options');
+  const duplicateHandlingSelect = document.getElementById('duplicate-handling-select');
+  const importCancelBtn = document.getElementById('import-cancel-btn');
+  const exportBtn = document.getElementById('export-btn');
+  const importBtn = document.getElementById('import-btn');
+  const fileInput = document.getElementById('import-file');
 
-  function loadPrompts() {
+  function trim(value) {
+    return (value || '').trim();
+  }
+
+  function createId(prefix) {
+    return `${prefix}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  function loadJsonArray(key) {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = localStorage.getItem(key);
       if (!raw) return [];
-      const data = JSON.parse(raw);
-      if (!Array.isArray(data)) return [];
-      return data
-        .filter(p => p && typeof p.id === 'string')
-        .map(p => hydrateLegacyPrompt(p))
-        .sort((a,b) => new Date(b.metadata?.createdAt || 0) - new Date(a.metadata?.createdAt || 0));
-    } catch (e) {
-      console.warn('Failed to parse stored prompts', e);
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+      console.warn(`Failed to parse ${key}`, error);
       return [];
     }
   }
 
-  function hydrateLegacyPrompt(p) {
-    // If metadata already exists and passes minimal validation, return as-is
-    if (p && p.metadata && typeof p.metadata === 'object' && p.metadata.model && p.metadata.createdAt) {
-      return p;
-    }
-    try {
-      const model = typeof p.model === 'string' ? p.model : 'unknown-model';
-      const meta = trackModel(model, p.content || '');
-      p.metadata = meta;
-      return p;
-    } catch {
-      // Fallback minimal metadata
-      p.metadata = {
-        model: 'unknown',
-        createdAt: new Date(p.createdAt || Date.now()).toISOString(),
-        updatedAt: new Date(p.createdAt || Date.now()).toISOString(),
-        tokenEstimate: estimateTokens(p.content || '', false)
-      };
-      return p;
-    }
+  function cloneNotesStore(store) {
+    return JSON.parse(JSON.stringify(store || {}));
+  }
+
+  function loadPrompts(forceRefresh) {
+    if (!forceRefresh && Array.isArray(state.prompts)) return state.prompts;
+    state.prompts = loadJsonArray(STORAGE_KEY)
+      .filter(prompt => prompt && typeof prompt.id === 'string')
+      .map(hydrateLegacyPrompt)
+      .sort((left, right) => new Date(right.metadata?.createdAt || 0) - new Date(left.metadata?.createdAt || 0));
+    return state.prompts;
   }
 
   function savePrompts(prompts) {
+    state.prompts = prompts;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(prompts));
+  }
+
+  function loadNotesStore(forceRefresh) {
+    if (!forceRefresh && state.notes && typeof state.notes === 'object') return state.notes;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(prompts));
-    } catch (e) {
-      console.error('Failed to save prompts', e);
+      const raw = localStorage.getItem(NOTES_KEY);
+      if (!raw) {
+        state.notes = {};
+        return state.notes;
+      }
+      const parsed = JSON.parse(raw);
+      state.notes = parsed && typeof parsed === 'object' ? parsed : {};
+      return state.notes;
+    } catch (error) {
+      console.warn('Notes storage corrupted, resetting.', error);
+      state.notes = {};
+      return state.notes;
     }
   }
 
-  function createId() {
-    return 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  function saveNotesStore(store) {
+    state.notes = store;
+    localStorage.setItem(NOTES_KEY, JSON.stringify(store));
   }
 
-  function trim(str) { return (str || '').trim(); }
+  function loadHistory(forceRefresh) {
+    if (!forceRefresh && Array.isArray(state.history)) return state.history;
+    const history = loadJsonArray(HISTORY_KEY)
+      .filter(item => item && typeof item.id === 'string' && typeof item.at === 'string')
+      .map(validateHistoryRecord)
+      .filter(Boolean)
+      .sort((left, right) => new Date(right.at) - new Date(left.at));
+    state.history = history.slice(0, MAX_HISTORY_ITEMS);
+    return state.history;
+  }
+
+  function saveHistory(history) {
+    state.history = history;
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+  }
 
   function getSelectedModel() {
     if (!modelSelectInput) return '';
-    if (modelSelectInput.value === 'custom') {
-      return trim(modelCustomInput?.value || '');
-    }
-    return trim(modelSelectInput.value);
+    return modelSelectInput.value === 'custom' ? trim(modelCustomInput?.value) : trim(modelSelectInput.value);
   }
 
   function updateModelInputState() {
     if (!modelSelectInput || !modelCustomInput) return;
     const isCustom = modelSelectInput.value === 'custom';
     modelCustomInput.hidden = !isCustom;
-    modelCustomInput.setAttribute('aria-hidden', String(!isCustom));
     modelCustomInput.required = isCustom;
+    modelCustomInput.setAttribute('aria-hidden', String(!isCustom));
     if (!isCustom) modelCustomInput.value = '';
-  }
-
-  function render(prompts) {
-    listEl.innerHTML = '';
-
-    if (!prompts.length) {
-      emptyEl.hidden = false;
-      countEl.textContent = '0';
-      return;
-    }
-    emptyEl.hidden = true;
-    countEl.textContent = String(prompts.length);
-
-    const frag = document.createDocumentFragment();
-    prompts.forEach(p => {
-      const node = cardTemplate.content.firstElementChild.cloneNode(true);
-      node.dataset.id = p.id;
-      node.querySelector('.card-title').textContent = p.title;
-      node.querySelector('.card-preview').textContent = preview(p.content);
-      const delBtn = node.querySelector('.delete-btn');
-      delBtn.addEventListener('click', () => deletePrompt(p.id));
-
-      // Metadata injection
-      const metaHost = node.querySelector('[data-role=metadata]');
-      if (metaHost) {
-        try {
-          metaHost.replaceChildren(buildMetadataDisplay(p.metadata));
-        } catch (err) {
-          console.warn('Failed to render metadata', err);
-          metaHost.textContent = 'Metadata error';
-        }
-      }
-
-      // Rating component mount point (insert before actions)
-      const main = node.querySelector('.card-main');
-      main.appendChild(buildRatingElement(p));
-      // Notes section injection
-      main.appendChild(buildNotesSection(p.id));
-      frag.appendChild(node);
-    });
-    listEl.appendChild(frag);
   }
 
   function preview(text) {
     return trim(text);
   }
 
+  function scheduleRender(prompts) {
+    if (state.renderFrame) cancelAnimationFrame(state.renderFrame);
+    state.renderFrame = requestAnimationFrame(() => {
+      state.renderFrame = 0;
+      render(prompts || loadPrompts());
+    });
+  }
+
+  function getNotes(promptId) {
+    const store = loadNotesStore();
+    const list = Array.isArray(store[promptId]) ? store[promptId] : [];
+    return list
+      .filter(note => note && typeof note.id === 'string' && typeof note.content === 'string')
+      .sort((left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0));
+  }
+
+  function noteSearchBlob(promptId) {
+    return getNotes(promptId).map(note => note.content).join(' ');
+  }
+
+  function getFilteredPrompts(prompts) {
+    const query = state.searchQuery.toLowerCase();
+    const model = state.modelFilter;
+    return prompts.filter(prompt => {
+      const matchesModel = !model || prompt.metadata?.model === model;
+      if (!matchesModel) return false;
+      if (!query) return true;
+      const haystack = [
+        prompt.title,
+        prompt.content,
+        prompt.metadata?.model || '',
+        noteSearchBlob(prompt.id)
+      ].join(' ').toLowerCase();
+      return haystack.includes(query);
+    });
+  }
+
+  function updateFilterControls(prompts) {
+    if (!filterModelSelect) return;
+    const models = Array.from(new Set(prompts.map(prompt => prompt.metadata?.model).filter(Boolean))).sort((left, right) => left.localeCompare(right));
+    const current = state.modelFilter;
+    filterModelSelect.innerHTML = '';
+    const allOption = document.createElement('option');
+    allOption.value = '';
+    allOption.textContent = 'All models';
+    filterModelSelect.appendChild(allOption);
+    models.forEach(model => {
+      const option = document.createElement('option');
+      option.value = model;
+      option.textContent = model;
+      filterModelSelect.appendChild(option);
+    });
+    filterModelSelect.value = models.includes(current) ? current : '';
+    state.modelFilter = filterModelSelect.value;
+  }
+
+  function setEmptyStateMessage(totalPrompts, filteredPrompts) {
+    if (!emptyEl) return;
+    const message = emptyEl.querySelector('p');
+    if (!message) return;
+    if (!totalPrompts) {
+      message.textContent = 'No prompts saved yet. Add your first one!';
+      return;
+    }
+    if (!filteredPrompts) {
+      message.textContent = 'No prompts match the current search or model filter.';
+    }
+  }
+
+  function updateFilterSummary(filteredCount, totalCount) {
+    if (!filterSummaryEl) return;
+    if (!totalCount) {
+      filterSummaryEl.textContent = 'Your library is empty.';
+      return;
+    }
+    if (!state.searchQuery && !state.modelFilter) {
+      filterSummaryEl.textContent = `Showing all ${totalCount} prompt${totalCount === 1 ? '' : 's'}.`;
+      return;
+    }
+    filterSummaryEl.textContent = `Showing ${filteredCount} of ${totalCount} prompt${totalCount === 1 ? '' : 's'}.`;
+  }
+
+  function render(prompts) {
+    const source = prompts || loadPrompts();
+    const filtered = getFilteredPrompts(source);
+    updateFilterControls(source);
+    updateFilterSummary(filtered.length, source.length);
+
+    listEl.innerHTML = '';
+    countEl.textContent = String(filtered.length);
+
+    if (!filtered.length) {
+      emptyEl.hidden = false;
+      setEmptyStateMessage(source.length, filtered.length);
+      return;
+    }
+
+    emptyEl.hidden = true;
+    const fragment = document.createDocumentFragment();
+
+    filtered.forEach((prompt, index) => {
+      const node = cardTemplate.content.firstElementChild.cloneNode(true);
+      node.dataset.id = prompt.id;
+      node.style.setProperty('--card-index', String(index));
+      node.querySelector('.card-title').textContent = prompt.title;
+      node.querySelector('.card-preview').textContent = preview(prompt.content);
+      node.querySelector('.delete-btn').addEventListener('click', () => deletePrompt(prompt.id));
+
+      const metaHost = node.querySelector('[data-role="metadata"]');
+      metaHost.replaceChildren(buildMetadataDisplay(prompt.metadata));
+
+      const main = node.querySelector('.card-main');
+      main.appendChild(buildRatingElement(prompt));
+      main.appendChild(buildNotesSection(prompt.id));
+      fragment.appendChild(node);
+    });
+
+    listEl.appendChild(fragment);
+  }
+
   function deletePrompt(id) {
-    const prompt = loadPrompts().find(p => p.id === id);
-    const shouldDelete = window.confirm('Are you sure you want to delete this prompt?');
-    if (!shouldDelete) return;
-    const prompts = loadPrompts().filter(p => p.id !== id);
+    const prompt = loadPrompts().find(item => item.id === id);
+    if (!prompt) return;
+    if (!window.confirm('Are you sure you want to delete this prompt?')) return;
+    const prompts = loadPrompts().filter(item => item.id !== id);
+    const notes = loadNotesStore();
+    delete notes[id];
     savePrompts(prompts);
-    if (prompt) {
-      appendHistoryEvent({
-        action: 'delete',
-        promptId: prompt.id,
-        title: prompt.title,
-        model: prompt?.metadata?.model || 'unknown'
-      });
-    }
-    render(prompts);
+    saveNotesStore(notes);
+    appendHistoryEvent({
+      action: 'delete',
+      promptId: prompt.id,
+      title: prompt.title,
+      model: prompt.metadata?.model || 'unknown'
+    });
+    scheduleRender(prompts);
   }
 
-  function loadHistory() {
-    try {
-      const raw = localStorage.getItem(HISTORY_KEY);
-      if (!raw) return [];
-      const data = JSON.parse(raw);
-      if (!Array.isArray(data)) return [];
-      const filtered = data.filter(item => item && typeof item.id === 'string' && typeof item.action === 'string' && typeof item.at === 'string');
-      return filtered.sort((a, b) => new Date(b.at) - new Date(a.at));
-    } catch (e) {
-      console.warn('Failed to parse history store', e);
-      return [];
-    }
-  }
-
-  function saveHistory(history) {
-    try {
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
-    } catch (e) {
-      console.error('Failed to save history', e);
-    }
-  }
-
-  function createHistoryId() {
-    return 'h_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 9);
+  function normalizeHistoryAction(action) {
+    return VALID_HISTORY_ACTIONS.has(action) ? action : 'save';
   }
 
   function appendHistoryEvent(event) {
     const history = loadHistory();
     history.unshift({
-      id: createHistoryId(),
-      action: event.action,
-      promptId: event.promptId || null,
-      title: event.title || 'Untitled',
-      model: event.model || 'unknown',
-      at: event.at || new Date().toISOString(),
-      details: event.details || ''
+      id: createId('h'),
+      action: normalizeHistoryAction(event.action),
+      promptId: typeof event.promptId === 'string' ? event.promptId : null,
+      title: trim(event.title) || 'Untitled',
+      model: trim(event.model) || 'unknown',
+      at: typeof event.at === 'string' ? event.at : new Date().toISOString(),
+      details: trim(event.details || '').slice(0, MAX_HISTORY_DETAIL_LENGTH)
     });
     if (history.length > MAX_HISTORY_ITEMS) history.length = MAX_HISTORY_ITEMS;
     saveHistory(history);
-    renderHistory(history);
+    if (!historyPanelEl.hidden) renderHistory(history);
   }
 
   function reconcileHistoryWithPrompts(prompts) {
     const history = loadHistory();
-    const savedPromptIds = new Set(
-      history
-        .filter(item => item.action === 'save' && typeof item.promptId === 'string')
-        .map(item => item.promptId)
-    );
-
+    const savedIds = new Set(history.filter(item => item.action === 'save' && item.promptId).map(item => item.promptId));
     let changed = false;
-    for (const prompt of prompts) {
-      if (!prompt || typeof prompt.id !== 'string') continue;
-      if (savedPromptIds.has(prompt.id)) continue;
-      history.push({
-        id: createHistoryId(),
-        action: 'save',
-        promptId: prompt.id,
-        title: prompt.title || 'Untitled',
-        model: prompt?.metadata?.model || 'unknown',
-        at: prompt?.metadata?.createdAt || new Date().toISOString(),
-        details: 'Recovered from existing saved prompts'
-      });
-      changed = true;
-    }
-
+    prompts.forEach(prompt => {
+      if (!savedIds.has(prompt.id)) {
+        history.push({
+          id: createId('h'),
+          action: 'save',
+          promptId: prompt.id,
+          title: prompt.title || 'Untitled',
+          model: prompt.metadata?.model || 'unknown',
+          at: prompt.metadata?.createdAt || new Date().toISOString(),
+          details: 'Recovered from existing saved prompts'
+        });
+        changed = true;
+      }
+    });
     if (changed) {
-      history.sort((a, b) => new Date(b.at) - new Date(a.at));
-      if (history.length > MAX_HISTORY_ITEMS) history.length = MAX_HISTORY_ITEMS;
-      saveHistory(history);
+      history.sort((left, right) => new Date(right.at) - new Date(left.at));
+      saveHistory(history.slice(0, MAX_HISTORY_ITEMS));
     }
-    return history;
+    return loadHistory(true);
   }
 
   function renderHistory(history) {
-    if (!historyListEl || !historyEmptyEl) return;
-    const sortedHistory = [...history].sort((a, b) => new Date(b.at) - new Date(a.at));
+    const items = [...history].sort((left, right) => new Date(right.at) - new Date(left.at));
     historyListEl.innerHTML = '';
-    if (!sortedHistory.length) {
-      historyEmptyEl.hidden = false;
-      return;
-    }
-    historyEmptyEl.hidden = true;
-    const frag = document.createDocumentFragment();
-    sortedHistory.forEach(item => {
+    historyEmptyEl.hidden = items.length > 0;
+    if (!items.length) return;
+    const fragment = document.createDocumentFragment();
+    items.forEach(item => {
       const li = document.createElement('li');
       li.className = 'history-item';
-      li.dataset.action = item.action;
-      const when = formatHistoryTs(item.at);
-      li.innerHTML = `
-        <div class="history-item-header">
-          <p class="history-item-title">${escapeHtml(item.title)}</p>
-          <time class="history-item-time" datetime="${item.at}">${when}</time>
-        </div>
-        <p class="history-item-meta">
-          <span class="history-action ${item.action}">${item.action}</span>
-          · Model: ${escapeHtml(item.model || 'unknown')}
-          ${item.details ? `· ${escapeHtml(item.details)}` : ''}
-        </p>
-      `;
-      frag.appendChild(li);
+      li.dataset.action = normalizeHistoryAction(item.action);
+
+      const header = document.createElement('div');
+      header.className = 'history-item-header';
+
+      const title = document.createElement('p');
+      title.className = 'history-item-title';
+      title.textContent = item.title;
+
+      const time = document.createElement('time');
+      time.className = 'history-item-time';
+      time.dateTime = item.at;
+      time.textContent = formatHistoryTs(item.at);
+
+      const meta = document.createElement('p');
+      meta.className = 'history-item-meta';
+
+      const action = document.createElement('span');
+      action.className = `history-action ${normalizeHistoryAction(item.action)}`;
+      action.textContent = normalizeHistoryAction(item.action);
+
+      meta.append(action, document.createTextNode(` · Model: ${item.model || 'unknown'}`));
+      if (item.details) meta.append(document.createTextNode(` · ${item.details}`));
+      header.append(title, time);
+      li.append(header, meta);
+      fragment.appendChild(li);
     });
-    historyListEl.appendChild(frag);
+    historyListEl.appendChild(fragment);
   }
 
   function formatHistoryTs(iso) {
@@ -272,59 +390,53 @@
   }
 
   function setActiveTab(tab) {
-    const isSaved = tab === 'saved';
-    if (!savedTabBtn || !historyTabBtn || !savedPanelEl || !historyPanelEl) return;
-    savedTabBtn.classList.toggle('is-active', isSaved);
-    historyTabBtn.classList.toggle('is-active', !isSaved);
-    savedTabBtn.setAttribute('aria-selected', String(isSaved));
-    historyTabBtn.setAttribute('aria-selected', String(!isSaved));
-    savedPanelEl.hidden = !isSaved;
-    historyPanelEl.hidden = isSaved;
-    if (!isSaved) renderHistory(loadHistory());
+    const saved = tab === 'saved';
+    savedTabBtn.classList.toggle('is-active', saved);
+    historyTabBtn.classList.toggle('is-active', !saved);
+    savedTabBtn.setAttribute('aria-selected', String(saved));
+    historyTabBtn.setAttribute('aria-selected', String(!saved));
+    savedPanelEl.hidden = !saved;
+    historyPanelEl.hidden = saved;
+    if (!saved) renderHistory(loadHistory());
   }
 
-  /* Rating Logic */
-  const MAX_STARS = 5;
-
-  function normalizeRating(val) {
-    if (val == null) return null;
-    const n = Number(val);
-    return n >= 1 && n <= MAX_STARS ? n : null;
+  function normalizeRating(value) {
+    if (value == null) return null;
+    const numeric = Number(value);
+    return numeric >= 1 && numeric <= MAX_STARS ? numeric : null;
   }
 
   function setRating(promptId, value) {
     const prompts = loadPrompts();
-    const prompt = prompts.find(p => p.id === promptId);
+    const prompt = prompts.find(item => item.id === promptId);
     if (!prompt) return;
     const current = normalizeRating(prompt.userRating);
     const next = normalizeRating(value);
-    // Toggle off if same value clicked
-    prompt.userRating = (current && next && current === next) ? null : next;
+    prompt.userRating = current && next && current === next ? null : next;
     savePrompts(prompts);
     updateCardRatingUI(promptId, prompt.userRating);
   }
 
   function buildRatingElement(prompt) {
-    // Ensure property exists for legacy stored prompts
     if (!('userRating' in prompt)) prompt.userRating = null;
     const wrap = document.createElement('div');
     wrap.className = 'rating';
     wrap.setAttribute('role', 'radiogroup');
     wrap.setAttribute('aria-label', `Rate ${prompt.title}`);
-    for (let i = 1; i <= MAX_STARS; i++) {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'star' + (prompt.userRating >= i ? ' filled' : '');
-      btn.dataset.value = String(i);
-      btn.setAttribute('role', 'radio');
-      btn.setAttribute('aria-checked', String(prompt.userRating === i));
-      btn.setAttribute('aria-label', `${i} star${i>1?'s':''}`);
-      btn.textContent = prompt.userRating >= i ? '★' : '☆';
-      btn.addEventListener('click', () => setRating(prompt.id, i));
-      btn.addEventListener('keydown', (e) => handleStarKey(e, prompt.id));
-      btn.addEventListener('pointerenter', () => previewHover(wrap, i));
-      btn.addEventListener('pointerleave', () => clearHover(wrap, prompt.userRating));
-      wrap.appendChild(btn);
+    for (let value = 1; value <= MAX_STARS; value += 1) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `star${prompt.userRating >= value ? ' filled' : ''}`;
+      button.dataset.value = String(value);
+      button.setAttribute('role', 'radio');
+      button.setAttribute('aria-checked', String(prompt.userRating === value));
+      button.setAttribute('aria-label', `${value} star${value > 1 ? 's' : ''}`);
+      button.textContent = prompt.userRating >= value ? '★' : '☆';
+      button.addEventListener('click', () => setRating(prompt.id, value));
+      button.addEventListener('keydown', event => handleStarKey(event, prompt.id));
+      button.addEventListener('pointerenter', () => previewHover(wrap, value));
+      button.addEventListener('pointerleave', () => clearHover(wrap, prompt.userRating));
+      wrap.appendChild(button);
     }
     return wrap;
   }
@@ -332,71 +444,75 @@
   function updateCardRatingUI(promptId, rating) {
     const card = listEl.querySelector(`[data-id="${promptId}"]`);
     if (!card) return;
-    const wrap = card.querySelector('.rating');
-    if (!wrap) return;
-    [...wrap.querySelectorAll('button.star')].forEach(btn => {
-      const val = Number(btn.dataset.value);
-      const filled = rating != null && rating >= val;
-      btn.classList.toggle('filled', filled);
-      btn.textContent = filled ? '★' : '☆';
-      btn.setAttribute('aria-checked', String(rating === val));
+    card.querySelectorAll('.rating button.star').forEach(button => {
+      const value = Number(button.dataset.value);
+      const filled = rating != null && rating >= value;
+      button.classList.toggle('filled', filled);
+      button.textContent = filled ? '★' : '☆';
+      button.setAttribute('aria-checked', String(rating === value));
     });
   }
 
-  function handleStarKey(e, promptId) {
-    const key = e.key;
-    const target = e.currentTarget;
-    if (!target || !target.dataset.value) return;
-    const currentVal = Number(target.dataset.value);
-    if (['ArrowRight','ArrowUp'].includes(key)) {
-      e.preventDefault();
-      const next = Math.min(MAX_STARS, currentVal + 1);
-      setRating(promptId, next);
-      focusStar(promptId, next);
-    } else if (['ArrowLeft','ArrowDown'].includes(key)) {
-      e.preventDefault();
-      const prev = Math.max(1, currentVal - 1);
-      setRating(promptId, prev);
-      focusStar(promptId, prev);
-    } else if (key === 'Home') {
-      e.preventDefault();
-      setRating(promptId, 1); focusStar(promptId, 1);
-    } else if (key === 'End') {
-      e.preventDefault();
-      setRating(promptId, MAX_STARS); focusStar(promptId, MAX_STARS);
-    } else if (key === 'Enter' || key === ' ') {
-      e.preventDefault();
-      setRating(promptId, currentVal);
-    } else if (key === 'Backspace' || key === 'Delete' || key === 'Escape') {
-      e.preventDefault();
+  function handleStarKey(event, promptId) {
+    const target = event.currentTarget;
+    if (!(target instanceof HTMLElement)) return;
+    const current = Number(target.dataset.value);
+    if (['ArrowRight', 'ArrowUp'].includes(event.key)) {
+      event.preventDefault();
+      focusStar(promptId, Math.min(MAX_STARS, current + 1));
+      setRating(promptId, Math.min(MAX_STARS, current + 1));
+      return;
+    }
+    if (['ArrowLeft', 'ArrowDown'].includes(event.key)) {
+      event.preventDefault();
+      focusStar(promptId, Math.max(1, current - 1));
+      setRating(promptId, Math.max(1, current - 1));
+      return;
+    }
+    if (event.key === 'Home') {
+      event.preventDefault();
+      focusStar(promptId, 1);
+      setRating(promptId, 1);
+      return;
+    }
+    if (event.key === 'End') {
+      event.preventDefault();
+      focusStar(promptId, MAX_STARS);
+      setRating(promptId, MAX_STARS);
+      return;
+    }
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      setRating(promptId, current);
+      return;
+    }
+    if (['Backspace', 'Delete', 'Escape'].includes(event.key)) {
+      event.preventDefault();
       setRating(promptId, null);
     }
   }
 
-  function focusStar(promptId, starVal) {
-    const card = listEl.querySelector(`[data-id="${promptId}"]`);
-    if (!card) return;
-    const star = card.querySelector(`.rating button.star[data-value="${starVal}"]`);
-    if (star) star.focus();
+  function focusStar(promptId, value) {
+    const star = listEl.querySelector(`[data-id="${promptId}"] .rating button.star[data-value="${value}"]`);
+    if (star instanceof HTMLElement) star.focus();
   }
 
-  function previewHover(wrap, hoverVal) {
-    wrap.setAttribute('data-hovering', 'true');
-    wrap.querySelectorAll('button.star').forEach(btn => {
-      const val = Number(btn.dataset.value);
-      btn.textContent = val <= hoverVal ? '★' : '☆';
+  function previewHover(wrap, hoverValue) {
+    wrap.querySelectorAll('button.star').forEach(button => {
+      const value = Number(button.dataset.value);
+      button.textContent = value <= hoverValue ? '★' : '☆';
     });
   }
+
   function clearHover(wrap, rating) {
-    wrap.removeAttribute('data-hovering');
-    wrap.querySelectorAll('button.star').forEach(btn => {
-      const val = Number(btn.dataset.value);
-      btn.textContent = rating && val <= rating ? '★' : '☆';
+    wrap.querySelectorAll('button.star').forEach(button => {
+      const value = Number(button.dataset.value);
+      button.textContent = rating && value <= rating ? '★' : '☆';
     });
   }
 
-  function handleSubmit(e) {
-    e.preventDefault();
+  function handleSubmit(event) {
+    event.preventDefault();
     errorEl.textContent = '';
 
     const title = trim(titleInput.value);
@@ -415,33 +531,24 @@
     }
     if (!modelName) {
       errorEl.textContent = 'Model is required. Choose one or type a custom model.';
-      if (modelSelectInput && modelSelectInput.value === 'custom') {
-        modelCustomInput.focus();
-      } else {
-        modelSelectInput.focus();
-      }
+      (modelSelectInput.value === 'custom' ? modelCustomInput : modelSelectInput).focus();
       return;
     }
 
     let metadata;
     try {
       metadata = trackModel(modelName, content);
-    } catch (err) {
-      errorEl.textContent = err.message || 'Metadata creation failed.';
+    } catch (error) {
+      errorEl.textContent = error.message || 'Metadata creation failed.';
       return;
     }
 
     const prompts = loadPrompts();
-    const newPrompt = { id: createId(), title, content, metadata };
-    prompts.unshift(newPrompt);
+    const prompt = { id: createId('p'), title, content, metadata, userRating: null };
+    prompts.unshift(prompt);
     savePrompts(prompts);
-    appendHistoryEvent({
-      action: 'save',
-      promptId: newPrompt.id,
-      title: newPrompt.title,
-      model: newPrompt.metadata.model
-    });
-    render(prompts);
+    appendHistoryEvent({ action: 'save', promptId: prompt.id, title: prompt.title, model: prompt.metadata.model });
+    scheduleRender(prompts);
 
     form.reset();
     if (modelSelectInput) modelSelectInput.value = 'gpt-4.1';
@@ -449,318 +556,295 @@
     titleInput.focus();
   }
 
-  function init() {
-    form.addEventListener('submit', handleSubmit);
-    if (modelSelectInput) {
-      modelSelectInput.addEventListener('change', () => {
-        updateModelInputState();
-        if (modelSelectInput.value === 'custom') modelCustomInput.focus();
-      });
-    }
-    if (savedTabBtn) savedTabBtn.addEventListener('click', () => setActiveTab('saved'));
-    if (historyTabBtn) historyTabBtn.addEventListener('click', () => setActiveTab('history'));
-    if (clearHistoryBtn) {
-      clearHistoryBtn.addEventListener('click', () => {
-        if (!window.confirm('Clear all history entries?')) return;
-        saveHistory([]);
-        renderHistory([]);
-      });
-    }
-    const prompts = loadPrompts();
-    render(prompts);
-    renderHistory(reconcileHistoryWithPrompts(prompts));
-    setActiveTab('saved');
-    updateModelInputState();
-    setupImportExport();
-  }
-
-  /* ================= Notes Feature ================= */
-  // Data shape: { [promptId]: [ { id, content, createdAt, updatedAt } ] }
-
-  function loadNotesStore() {
-    try {
-      const raw = localStorage.getItem(NOTES_KEY);
-      if (!raw) return {};
-      const data = JSON.parse(raw);
-      return data && typeof data === 'object' ? data : {};
-    } catch (e) {
-      console.warn('Notes storage corrupted, resetting.', e);
-      return {};
-    }
-  }
-
-  function saveNotesStore(store) {
-    try {
-      localStorage.setItem(NOTES_KEY, JSON.stringify(store));
-    } catch (e) {
-      console.error('Failed to persist notes', e);
-      // Could expose inline error in each notes section on next render
-    }
-  }
-
-  function getNotes(promptId) {
-    const store = loadNotesStore();
-    const arr = Array.isArray(store[promptId]) ? store[promptId] : [];
-    return arr
-      .filter(n => n && typeof n.id === 'string' && typeof n.content === 'string')
-      .sort((a,b) => b.createdAt - a.createdAt);
+  function noteId() {
+    return createId('note');
   }
 
   function addNote(promptId, content) {
-    const trimmed = (content || '').trim();
-    if (!trimmed) return { error: 'Note cannot be empty.' };
+    const value = trim(content);
+    if (!value) return { error: 'Note cannot be empty.' };
+    if (value.length > MAX_NOTE_CONTENT_LENGTH) return { error: `Note cannot exceed ${MAX_NOTE_CONTENT_LENGTH} characters.` };
     const store = loadNotesStore();
     if (!Array.isArray(store[promptId])) store[promptId] = [];
-    const note = { id: noteId(), content: trimmed, createdAt: Date.now(), updatedAt: Date.now() };
+    const timestamp = Date.now();
+    const note = { id: noteId(), content: value, createdAt: timestamp, updatedAt: timestamp };
     store[promptId].unshift(note);
     saveNotesStore(store);
     return { note };
   }
 
-  function updateNote(promptId, noteIdVal, newContent) {
+  function updateNote(promptId, noteIdValue, nextContent) {
+    const value = trim(nextContent);
+    if (!value) return { error: 'Note cannot be empty.' };
+    if (value.length > MAX_NOTE_CONTENT_LENGTH) return { error: `Note cannot exceed ${MAX_NOTE_CONTENT_LENGTH} characters.` };
     const store = loadNotesStore();
     const list = Array.isArray(store[promptId]) ? store[promptId] : [];
-    const note = list.find(n => n.id === noteIdVal);
+    const note = list.find(item => item.id === noteIdValue);
     if (!note) return { error: 'Note not found.' };
-    const val = (newContent || '').trim();
-    if (!val) return { error: 'Note cannot be empty.' };
-    note.content = val;
+    note.content = value;
     note.updatedAt = Date.now();
     saveNotesStore(store);
     return { note };
   }
 
-  function deleteNote(promptId, noteIdVal) {
+  function deleteNote(promptId, noteIdValue) {
     const store = loadNotesStore();
     const list = Array.isArray(store[promptId]) ? store[promptId] : [];
-    const idx = list.findIndex(n => n.id === noteIdVal);
-    if (idx === -1) return false;
-    list.splice(idx, 1);
+    const index = list.findIndex(item => item.id === noteIdValue);
+    if (index === -1) return false;
+    list.splice(index, 1);
     saveNotesStore(store);
     return true;
   }
 
-  function noteId() {
-    return 'note_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,6);
-  }
-
   function buildNotesSection(promptId) {
-    const wrap = document.createElement('section');
-    wrap.className = 'notes';
-    wrap.dataset.promptId = promptId;
-    wrap.setAttribute('aria-labelledby', `notes-title-${promptId}`);
-    wrap.innerHTML = `
-      <div class="notes-header">
-        <h4 id="notes-title-${promptId}" class="notes-title">Notes</h4>
-        <button type="button" class="add-note-btn" data-action="add-note" aria-label="Add note" data-prompt-id="${promptId}">Add</button>
-      </div>
-      <div class="notes-error" hidden></div>
-      <ul class="notes-list" role="list"></ul>
-    `;
-    renderNotesList(promptId, wrap.querySelector('.notes-list'));
-    attachNotesHandlers(wrap);
-    return wrap;
+    const section = document.createElement('section');
+    section.className = 'notes';
+    section.dataset.promptId = promptId;
+    section.setAttribute('aria-labelledby', `notes-title-${promptId}`);
+
+    const header = document.createElement('div');
+    header.className = 'notes-header';
+
+    const title = document.createElement('h4');
+    title.id = `notes-title-${promptId}`;
+    title.className = 'notes-title';
+    title.textContent = 'Notes';
+
+    const addButton = document.createElement('button');
+    addButton.type = 'button';
+    addButton.className = 'add-note-btn';
+    addButton.dataset.action = 'add-note';
+    addButton.textContent = 'Add';
+
+    const error = document.createElement('div');
+    error.className = 'notes-error';
+    error.hidden = true;
+
+    const list = document.createElement('ul');
+    list.className = 'notes-list';
+    list.setAttribute('role', 'list');
+
+    header.append(title, addButton);
+    section.append(header, error, list);
+    renderNotesList(promptId, list);
+    attachNotesHandlers(section);
+    return section;
   }
 
   function renderNotesList(promptId, listRoot) {
     listRoot.innerHTML = '';
     const notes = getNotes(promptId);
     if (!notes.length) {
-      const empty = document.createElement('li');
-      empty.innerHTML = '<p class="note-content" style="margin:0;font-size:.6rem;color:var(--text-soft);">No notes yet.</p>';
-      listRoot.appendChild(empty);
+      const item = document.createElement('li');
+      const text = document.createElement('p');
+      text.className = 'note-content';
+      text.textContent = 'No notes yet.';
+      item.appendChild(text);
+      listRoot.appendChild(item);
       return;
     }
-    const frag = document.createDocumentFragment();
-    notes.forEach(n => frag.appendChild(renderNoteItem(promptId, n)));
-    listRoot.appendChild(frag);
+    const fragment = document.createDocumentFragment();
+    notes.forEach(note => fragment.appendChild(renderNoteItem(promptId, note)));
+    listRoot.appendChild(fragment);
   }
 
   function renderNoteItem(promptId, note) {
     const li = document.createElement('li');
     li.className = 'note';
     li.dataset.noteId = note.id;
-    const edited = note.updatedAt && note.updatedAt !== note.createdAt;
-    li.innerHTML = `
-      <p class="note-content" data-role="content"></p>
-      <div class="note-meta">
-        <time>${formatTs(note.createdAt)}${edited ? ' · Edited' : ''}</time>
-        <div class="note-buttons">
-          <button type="button" data-action="edit-note" aria-label="Edit note">Edit</button>
-          <button type="button" data-action="delete-note" aria-label="Delete note">Del</button>
-        </div>
-      </div>
-    `;
-    li.querySelector('[data-role=content]').textContent = note.content;
+
+    const content = document.createElement('p');
+    content.className = 'note-content';
+    content.dataset.role = 'content';
+    content.textContent = note.content;
+
+    const meta = document.createElement('div');
+    meta.className = 'note-meta';
+
+    const time = document.createElement('time');
+    const edited = Number(note.updatedAt || 0) > Number(note.createdAt || 0);
+    time.textContent = `${formatTs(note.createdAt)}${edited ? ' · Edited' : ''}`;
+
+    const buttons = document.createElement('div');
+    buttons.className = 'note-buttons';
+
+    const edit = document.createElement('button');
+    edit.type = 'button';
+    edit.dataset.action = 'edit-note';
+    edit.textContent = 'Edit';
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.dataset.action = 'delete-note';
+    remove.textContent = 'Del';
+
+    buttons.append(edit, remove);
+    meta.append(time, buttons);
+    li.append(content, meta);
     return li;
   }
 
-  function formatTs(ts) {
+  function buildNoteEditor(id, labelText, value) {
+    const wrapper = document.createElement('div');
+    const label = document.createElement('label');
+    label.className = 'visually-hidden';
+    label.htmlFor = id;
+    label.textContent = labelText;
+
+    const textarea = document.createElement('textarea');
+    textarea.id = id;
+    textarea.dataset.role = 'editor';
+    textarea.value = value || '';
+    textarea.placeholder = 'Write a note...';
+
+    const validation = document.createElement('div');
+    validation.className = 'note-validation';
+    validation.dataset.role = 'validation';
+
+    wrapper.append(label, textarea, validation);
+    return wrapper;
+  }
+
+  function buildNoteControls() {
+    const controls = document.createElement('div');
+    controls.className = 'note-controls';
+
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.dataset.action = 'save-note';
+    save.textContent = 'Save';
+
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.dataset.action = 'cancel-note';
+    cancel.textContent = 'Cancel';
+
+    controls.append(save, cancel);
+    return controls;
+  }
+
+  function formatTs(timestamp) {
     try {
-      const d = new Date(ts);
-      return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-    } catch { return '—'; }
+      return new Date(timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    } catch {
+      return 'Unknown';
+    }
   }
 
   function attachNotesHandlers(section) {
-    section.addEventListener('click', (e) => {
-      const target = e.target;
+    section.addEventListener('click', event => {
+      const target = event.target;
       if (!(target instanceof HTMLElement)) return;
       const action = target.dataset.action;
       if (!action) return;
       const promptId = section.dataset.promptId;
       if (!promptId) return;
+
       if (action === 'add-note') {
         spawnNewNoteEditor(section, promptId);
-      } else if (action === 'edit-note') {
-        const noteEl = target.closest('.note');
-        if (noteEl) enterEditNote(section, promptId, noteEl.dataset.noteId);
-      } else if (action === 'delete-note') {
-        const noteEl = target.closest('.note');
-        if (noteEl && confirm('Delete this note?')) {
-          deleteNote(promptId, noteEl.dataset.noteId);
-          renderNotesList(promptId, section.querySelector('.notes-list'));
-        }
-      } else if (action === 'save-note') {
-        const editor = target.closest('.note');
-        if (editor) commitNoteEdit(section, promptId, editor, false);
-      } else if (action === 'cancel-note') {
-        const editor = target.closest('.note');
-        if (editor) cancelNoteEdit(section, promptId, editor);
+        return;
+      }
+      const noteElement = target.closest('.note');
+      if (!noteElement) return;
+
+      if (action === 'edit-note') {
+        enterEditNote(section, promptId, noteElement.dataset.noteId);
+        return;
+      }
+      if (action === 'delete-note') {
+        if (!window.confirm('Delete this note?')) return;
+        deleteNote(promptId, noteElement.dataset.noteId);
+        renderNotesList(promptId, section.querySelector('.notes-list'));
+        return;
+      }
+      if (action === 'save-note') {
+        commitNoteEdit(section, promptId, noteElement);
+        return;
+      }
+      if (action === 'cancel-note') {
+        cancelNoteEdit(section, promptId, noteElement);
       }
     });
-    section.addEventListener('keydown', (e) => {
-      const target = e.target;
+
+    section.addEventListener('keydown', event => {
+      const target = event.target;
       if (!(target instanceof HTMLTextAreaElement)) return;
-      if (e.key === 'Escape') {
-        const editor = target.closest('.note');
-        if (editor) cancelNoteEdit(section, section.dataset.promptId, editor);
-      } else if ((e.key === 'Enter' && (e.metaKey || e.ctrlKey))) {
-        const editor = target.closest('.note');
-        if (editor) commitNoteEdit(section, section.dataset.promptId, editor, false);
+      const noteElement = target.closest('.note');
+      const promptId = section.dataset.promptId;
+      if (!noteElement || !promptId) return;
+      if (event.key === 'Escape') {
+        cancelNoteEdit(section, promptId, noteElement);
+      }
+      if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault();
+        commitNoteEdit(section, promptId, noteElement);
       }
     });
   }
 
   function spawnNewNoteEditor(section, promptId) {
-    // Prevent multiple new editors at once
-    if (section.querySelector('.note.editing[data-mode=new]')) {
-      section.querySelector('.note.editing[data-mode=new] textarea')?.focus();
+    const existing = section.querySelector('.note.editing[data-mode="new"] textarea');
+    if (existing instanceof HTMLElement) {
+      existing.focus();
       return;
     }
-    const listRoot = section.querySelector('.notes-list');
-    const li = document.createElement('li');
-    li.className = 'note editing';
-    li.dataset.mode = 'new';
-    li.innerHTML = `
-      <div>
-        <label class="visually-hidden" for="new-note-${promptId}">New note</label>
-        <textarea id="new-note-${promptId}" data-role="editor" placeholder="Write a note..." aria-label="New note"></textarea>
-        <div class="note-validation" data-role="validation"></div>
-      </div>
-      <div class="note-controls">
-        <button type="button" data-action="save-note">Save</button>
-        <button type="button" data-action="cancel-note">Cancel</button>
-      </div>
-    `;
-    listRoot.insertBefore(li, listRoot.firstChild);
-    li.querySelector('textarea').focus();
+    const list = section.querySelector('.notes-list');
+    const item = document.createElement('li');
+    item.className = 'note editing';
+    item.dataset.mode = 'new';
+    item.append(buildNoteEditor(`new-note-${promptId}`, 'New note', ''), buildNoteControls());
+    list.insertBefore(item, list.firstChild);
+    item.querySelector('textarea').focus();
   }
 
-  function enterEditNote(section, promptId, noteIdVal) {
-    const node = section.querySelector(`.note[data-note-id="${noteIdVal}"]`);
-    if (!node || node.classList.contains('editing')) return;
-    const contentEl = node.querySelector('[data-role=content]');
-    const original = contentEl.textContent || '';
-    node.classList.add('editing');
-    node.dataset.mode = 'edit';
-    node.dataset.original = original;
-    node.innerHTML = `
-      <div>
-        <label class="visually-hidden" for="edit-${noteIdVal}">Edit note</label>
-        <textarea id="edit-${noteIdVal}" data-role="editor" aria-label="Edit note">${escapeHtml(original)}</textarea>
-        <div class="note-validation" data-role="validation"></div>
-      </div>
-      <div class="note-controls">
-        <button type="button" data-action="save-note">Save</button>
-        <button type="button" data-action="cancel-note">Cancel</button>
-      </div>
-    `;
-    node.querySelector('textarea').focus();
+  function enterEditNote(section, promptId, noteIdValue) {
+    const item = section.querySelector(`.note[data-note-id="${noteIdValue}"]`);
+    if (!item || item.classList.contains('editing')) return;
+    const original = item.querySelector('[data-role="content"]')?.textContent || '';
+    item.classList.add('editing');
+    item.dataset.mode = 'edit';
+    item.dataset.original = original;
+    item.replaceChildren(buildNoteEditor(`edit-${noteIdValue}`, 'Edit note', original), buildNoteControls());
+    item.querySelector('textarea').focus();
   }
 
-  function commitNoteEdit(section, promptId, editorNode, silent) {
+  function commitNoteEdit(section, promptId, editorNode) {
     const textarea = editorNode.querySelector('textarea');
-    if (!textarea) return;
-    const validationEl = editorNode.querySelector('[data-role=validation]');
+    const validation = editorNode.querySelector('[data-role="validation"]');
+    if (!(textarea instanceof HTMLTextAreaElement) || !(validation instanceof HTMLElement)) return;
     const mode = editorNode.dataset.mode;
-    const value = textarea.value.trim();
-    if (!value) {
-      validationEl.textContent = 'Note cannot be empty.';
+    const value = textarea.value;
+    const result = mode === 'new'
+      ? addNote(promptId, value)
+      : updateNote(promptId, editorNode.dataset.noteId, value);
+    if (result.error) {
+      validation.textContent = result.error;
       textarea.focus();
       return;
-    }
-    if (mode === 'new') {
-      const { error } = addNote(promptId, value);
-      if (error) { validationEl.textContent = error; return; }
-    } else if (mode === 'edit') {
-      const noteIdVal = editorNode.dataset.noteId;
-      const { error } = updateNote(promptId, noteIdVal, value);
-      if (error) { validationEl.textContent = error; return; }
     }
     renderNotesList(promptId, section.querySelector('.notes-list'));
   }
 
   function cancelNoteEdit(section, promptId, editorNode) {
-    const mode = editorNode.dataset.mode;
-    if (mode === 'new') {
+    if (editorNode.dataset.mode === 'new') {
       editorNode.remove();
-      // If list now empty, re-render to show empty state message
       const list = section.querySelector('.notes-list');
       if (!list.querySelector('.note')) renderNotesList(promptId, list);
-    } else if (mode === 'edit') {
-      // Restore original
-      const original = editorNode.dataset.original || '';
-      const noteIdVal = editorNode.dataset.noteId;
-      const storeNote = getNotes(promptId).find(n => n.id === noteIdVal);
-      if (storeNote) {
-        const replacement = renderNoteItem(promptId, storeNote);
-        editorNode.replaceWith(replacement);
-      } else {
-        editorNode.remove();
-      }
+      return;
+    }
+    const note = getNotes(promptId).find(item => item.id === editorNode.dataset.noteId);
+    if (note) {
+      editorNode.replaceWith(renderNoteItem(promptId, note));
+    } else {
+      editorNode.remove();
     }
   }
 
-  function escapeHtml(str) {
-    return str.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c]));
-  }
-
-  document.addEventListener('DOMContentLoaded', init);
-
-  /* ================= Metadata System ================= */
-  // Types (JSDoc):
-  /**
-   * @typedef {Object} TokenEstimate
-   * @property {number} min
-   * @property {number} max
-   * @property {'high'|'medium'|'low'} confidence
-   */
-  /**
-   * @typedef {Object} MetadataObject
-   * @property {string} model
-   * @property {string} createdAt
-   * @property {string} updatedAt
-   * @property {TokenEstimate} tokenEstimate
-   */
-
   function isIsoString(value) {
-    if (typeof value !== 'string') return false;
-    // Basic ISO 8601 UTC format validation
-    return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) && !isNaN(Date.parse(value));
+    return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) && !Number.isNaN(Date.parse(value));
   }
 
-  /** Estimate tokens from text */
   function estimateTokens(text, isCode) {
     if (typeof text !== 'string') throw new Error('estimateTokens: text must be a string');
     if (typeof isCode !== 'boolean') throw new Error('estimateTokens: isCode must be a boolean');
@@ -769,16 +853,18 @@
     let min = 0.75 * words;
     let max = 0.25 * chars;
     if (isCode) {
-      min = min * 1.3;
-      max = max * 1.3;
+      min *= 1.3;
+      max *= 1.3;
     }
-    if (min > max) { // ensure ordering
-      const tmp = min; min = max; max = tmp;
+    if (min > max) {
+      const swap = min;
+      min = max;
+      max = swap;
     }
-    const span = max;
+    const span = max - min;
     let confidence = 'high';
     if (span >= 1000 && span <= 5000) confidence = 'medium';
-    else if (span > 5000) confidence = 'low';
+    if (span > 5000) confidence = 'low';
     return {
       min: Number(min.toFixed(2)),
       max: Number(max.toFixed(2)),
@@ -786,181 +872,268 @@
     };
   }
 
-  /** Create metadata for a model & content */
-  function trackModel(modelName, content) {
-    if (typeof modelName !== 'string' || !modelName.trim()) {
-      throw new Error('trackModel: modelName must be a non-empty string');
-    }
-    const model = modelName.trim();
-    if (model.length > 100) throw new Error('trackModel: modelName exceeds 100 characters');
-    if (typeof content !== 'string') throw new Error('trackModel: content must be a string');
-    const createdAt = new Date().toISOString();
-    const tokenEstimate = estimateTokens(content, looksLikeCode(content));
-    const meta = { model, createdAt, updatedAt: createdAt, tokenEstimate };
-    validateMetadata(meta);
-    return meta;
+  function looksLikeCode(text) {
+    return /[;{}<>]|\b(function|const|let|var|class|def|return|if|for|while)\b/.test(text);
   }
 
-  /** Update updatedAt, enforcing ordering */
-  function updateTimestamps(metadata) {
-    if (!metadata || typeof metadata !== 'object') throw new Error('updateTimestamps: metadata object required');
-    if (!isIsoString(metadata.createdAt)) throw new Error('updateTimestamps: invalid createdAt');
-    const updatedAt = new Date().toISOString();
-    if (new Date(updatedAt) < new Date(metadata.createdAt)) {
-      throw new Error('updateTimestamps: updatedAt earlier than createdAt');
-    }
-    metadata.updatedAt = updatedAt;
+  function validateMetadata(metadata) {
+    if (!metadata || typeof metadata !== 'object') throw new Error('Metadata invalid: missing object');
+    if (typeof metadata.model !== 'string' || !trim(metadata.model)) throw new Error('Metadata invalid: model required');
+    if (metadata.model.length > 100) throw new Error('Metadata invalid: model too long');
+    if (!isIsoString(metadata.createdAt)) throw new Error('Metadata invalid: createdAt not ISO string');
+    if (!isIsoString(metadata.updatedAt)) throw new Error('Metadata invalid: updatedAt not ISO string');
+    if (new Date(metadata.updatedAt) < new Date(metadata.createdAt)) throw new Error('Metadata invalid: updatedAt earlier than createdAt');
+    if (!metadata.tokenEstimate || typeof metadata.tokenEstimate !== 'object') throw new Error('Metadata invalid: tokenEstimate missing');
+    if (typeof metadata.tokenEstimate.min !== 'number' || typeof metadata.tokenEstimate.max !== 'number') throw new Error('Metadata invalid: token bounds');
+    if (!['high', 'medium', 'low'].includes(metadata.tokenEstimate.confidence)) throw new Error('Metadata invalid: confidence');
+  }
+
+  function trackModel(modelName, content) {
+    if (typeof modelName !== 'string' || !trim(modelName)) throw new Error('trackModel: modelName must be a non-empty string');
+    if (typeof content !== 'string') throw new Error('trackModel: content must be a string');
+    const createdAt = new Date().toISOString();
+    const metadata = {
+      model: trim(modelName),
+      createdAt,
+      updatedAt: createdAt,
+      tokenEstimate: estimateTokens(content, looksLikeCode(content))
+    };
     validateMetadata(metadata);
     return metadata;
   }
 
-  function validateMetadata(meta) {
-    if (typeof meta.model !== 'string' || !meta.model.trim()) throw new Error('Metadata invalid: model required');
-    if (meta.model.length > 100) throw new Error('Metadata invalid: model too long');
-    if (!isIsoString(meta.createdAt)) throw new Error('Metadata invalid: createdAt not ISO string');
-    if (!isIsoString(meta.updatedAt)) throw new Error('Metadata invalid: updatedAt not ISO string');
-    if (new Date(meta.updatedAt) < new Date(meta.createdAt)) throw new Error('Metadata invalid: updatedAt earlier than createdAt');
-    const te = meta.tokenEstimate;
-    if (!te || typeof te !== 'object') throw new Error('Metadata invalid: tokenEstimate missing');
-    if (typeof te.min !== 'number' || typeof te.max !== 'number') throw new Error('Metadata invalid: tokenEstimate bounds');
-    if (!['high','medium','low'].includes(te.confidence)) throw new Error('Metadata invalid: confidence');
+  function hydrateLegacyPrompt(prompt) {
+    if (prompt && prompt.metadata && typeof prompt.metadata === 'object') {
+      try {
+        validateMetadata(prompt.metadata);
+        return { ...prompt, userRating: normalizeRating(prompt.userRating) };
+      } catch {
+      }
+    }
+    return {
+      ...prompt,
+      metadata: trackModel(prompt.model || 'unknown-model', prompt.content || ''),
+      userRating: normalizeRating(prompt.userRating)
+    };
   }
 
-  function looksLikeCode(text) {
-    // Heuristic: presence of typical code characters vs length
-    const codeSignals = /[;{}<>]|\b(function|const|let|var|class|def|return|if|for|while)\b/;
-    return codeSignals.test(text);
-  }
+  function buildMetadataDisplay(metadata) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'prompt-meta';
+    if (!metadata) {
+      wrapper.textContent = 'No metadata';
+      return wrapper;
+    }
 
-  function buildMetadataDisplay(meta) {
-    const wrap = document.createElement('div');
-    wrap.className = 'prompt-meta';
-    if (!meta) { wrap.textContent = 'No metadata'; return wrap; }
-    const row1 = document.createElement('div');
-    row1.className = 'prompt-meta-row';
+    const rowOne = document.createElement('div');
+    rowOne.className = 'prompt-meta-row';
+
     const modelTag = document.createElement('span');
     modelTag.className = 'prompt-meta-tag';
-    modelTag.innerHTML = `<span class="model-name" title="Model Name">${escapeHtml(meta.model)}</span>`;
-    row1.appendChild(modelTag);
+    const modelLabel = document.createElement('span');
+    modelLabel.className = 'meta-label';
+    modelLabel.textContent = 'Model';
+    const modelName = document.createElement('span');
+    modelName.className = 'model-name';
+    modelName.textContent = metadata.model;
+    modelTag.append(modelLabel, modelName);
 
-    const tokenEl = document.createElement('span');
-    tokenEl.className = 'token-estimate';
-    tokenEl.dataset.confidence = meta.tokenEstimate?.confidence || 'high';
-    tokenEl.innerHTML = `<span>Tokens:</span><span class="token-range">${meta.tokenEstimate.min}&ndash;${meta.tokenEstimate.max}</span><span>(${meta.tokenEstimate.confidence})</span>`;
-    row1.appendChild(tokenEl);
+    const tokenTag = document.createElement('span');
+    tokenTag.className = 'token-estimate';
+    tokenTag.dataset.confidence = metadata.tokenEstimate.confidence;
+    const tokenLabel = document.createElement('span');
+    tokenLabel.className = 'meta-label';
+    tokenLabel.textContent = 'Tokens';
+    const tokenRange = document.createElement('span');
+    tokenRange.className = 'token-range';
+    tokenRange.textContent = `${metadata.tokenEstimate.min}-${metadata.tokenEstimate.max}`;
+    tokenTag.append(tokenLabel, tokenRange);
+    rowOne.append(modelTag, tokenTag);
 
-    const row2 = document.createElement('div');
-    row2.className = 'prompt-meta-row';
+    const rowTwo = document.createElement('div');
+    rowTwo.className = 'prompt-meta-row';
     const createdLabel = document.createElement('span');
     createdLabel.className = 'meta-label';
-    createdLabel.textContent = 'Created:';
-    const created = document.createElement('time');
-    created.dateTime = meta.createdAt;
-    created.title = 'Created';
-    created.textContent = humanTime(meta.createdAt);
+    createdLabel.textContent = 'Created';
+    const createdTime = document.createElement('time');
+    createdTime.dateTime = metadata.createdAt;
+    createdTime.textContent = humanTime(metadata.createdAt);
     const updatedLabel = document.createElement('span');
     updatedLabel.className = 'meta-label';
-    updatedLabel.textContent = 'Updated:';
-    const updated = document.createElement('time');
-    updated.dateTime = meta.updatedAt;
-    updated.title = 'Updated';
-    updated.textContent = humanTime(meta.updatedAt);
-    row2.appendChild(createdLabel);
-    row2.appendChild(created);
-    row2.appendChild(updatedLabel);
-    row2.appendChild(updated);
-    wrap.appendChild(row1);
-    wrap.appendChild(row2);
-    return wrap;
+    updatedLabel.textContent = 'Updated';
+    const updatedTime = document.createElement('time');
+    updatedTime.dateTime = metadata.updatedAt;
+    updatedTime.textContent = humanTime(metadata.updatedAt);
+    rowTwo.append(createdLabel, createdTime, updatedLabel, updatedTime);
+
+    wrapper.append(rowOne, rowTwo);
+    return wrapper;
   }
 
   function humanTime(iso) {
     try {
-      const d = new Date(iso);
-      return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-    } catch { return iso; }
-  }
-
-  // Expose for debugging in console
-  window.__promptMeta = { trackModel, updateTimestamps, estimateTokens };
-
-  /* ================= Export / Import System ================= */
-  const EXPORT_SCHEMA_VERSION = 2;
-  const EXPORT_FILE_BASENAME = 'prompt-library-export';
-
-  /** Compute statistics from prompts */
-  function computeStats(prompts) {
-    const total = prompts.length;
-    const ratings = prompts.map(p => typeof p.userRating === 'number' ? p.userRating : null).filter(Boolean);
-    const averageRating = ratings.length ? Number((ratings.reduce((a,b)=>a+b,0) / ratings.length).toFixed(2)) : null;
-    // most used model
-    const modelCounts = {};
-    for (const p of prompts) {
-      const m = p?.metadata?.model || 'unknown';
-      modelCounts[m] = (modelCounts[m]||0)+1;
+      return new Date(iso).toLocaleString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+    } catch {
+      return iso;
     }
-    let mostUsedModel = null; let max = -1;
-    for (const [m,c] of Object.entries(modelCounts)) { if (c>max) { max=c; mostUsedModel=m; } }
-    return { totalPrompts: total, averageRating, mostUsedModel };
   }
 
-  /** Validate a single prompt record minimally */
-  function validatePromptRecord(p) {
-    if (!p || typeof p !== 'object') throw new Error('Prompt not an object');
-    if (typeof p.id !== 'string') throw new Error('Prompt missing id');
-    if (typeof p.title !== 'string') throw new Error('Prompt missing title');
-    if (typeof p.content !== 'string') throw new Error('Prompt missing content');
-    if (!p.metadata || typeof p.metadata !== 'object') throw new Error('Prompt missing metadata');
-    try { validateMetadata(p.metadata); } catch (e) { throw new Error('Metadata invalid for prompt '+p.id+': '+e.message); }
+  function computeStats(prompts, notes, history) {
+    const ratings = prompts.map(prompt => normalizeRating(prompt.userRating)).filter(Boolean);
+    const models = {};
+    prompts.forEach(prompt => {
+      const model = prompt.metadata?.model || 'unknown';
+      models[model] = (models[model] || 0) + 1;
+    });
+    let mostUsedModel = null;
+    let mostUsedCount = -1;
+    Object.entries(models).forEach(([model, count]) => {
+      if (count > mostUsedCount) {
+        mostUsedModel = model;
+        mostUsedCount = count;
+      }
+    });
+    const noteCount = Object.values(notes).reduce((sum, list) => sum + (Array.isArray(list) ? list.length : 0), 0);
+    return {
+      totalPrompts: prompts.length,
+      totalNotes: noteCount,
+      totalHistoryEvents: history.length,
+      averageRating: ratings.length ? Number((ratings.reduce((sum, value) => sum + value, 0) / ratings.length).toFixed(2)) : null,
+      mostUsedModel
+    };
+  }
+
+  function validatePromptRecord(prompt) {
+    if (!prompt || typeof prompt !== 'object') throw new Error('Prompt not an object');
+    if (typeof prompt.id !== 'string') throw new Error('Prompt missing id');
+    if (typeof prompt.title !== 'string') throw new Error('Prompt missing title');
+    if (typeof prompt.content !== 'string') throw new Error('Prompt missing content');
+    validateMetadata(prompt.metadata);
   }
 
   function assertPromptIdsUnique(prompts) {
     const seen = new Set();
-    for (const p of prompts) {
-      if (seen.has(p.id)) throw new Error(`Duplicate prompt id found in import file: ${p.id}`);
-      seen.add(p.id);
-    }
+    prompts.forEach(prompt => {
+      if (seen.has(prompt.id)) throw new Error(`Duplicate prompt id found in import file: ${prompt.id}`);
+      seen.add(prompt.id);
+    });
+  }
+
+  function validateNoteRecord(note) {
+    if (!note || typeof note !== 'object') return null;
+    if (typeof note.id !== 'string') return null;
+    const content = trim(note.content);
+    if (!content || content.length > MAX_NOTE_CONTENT_LENGTH) return null;
+    const createdAt = Number(note.createdAt || Date.now());
+    const updatedAt = Number(note.updatedAt || createdAt);
+    return {
+      id: note.id,
+      content,
+      createdAt,
+      updatedAt
+    };
+  }
+
+  function sanitizeNotesStore(candidate, validPromptIds) {
+    if (!candidate || typeof candidate !== 'object') return {};
+    const sanitized = {};
+    let total = 0;
+    Object.entries(candidate).forEach(([promptId, notes]) => {
+      if (!validPromptIds.has(promptId) || !Array.isArray(notes)) return;
+      const cleaned = [];
+      const seen = new Set();
+      notes.forEach(note => {
+        if (total >= MAX_IMPORT_NOTES) return;
+        const validated = validateNoteRecord(note);
+        if (!validated || seen.has(validated.id)) return;
+        seen.add(validated.id);
+        cleaned.push(validated);
+        total += 1;
+      });
+      if (cleaned.length) {
+        cleaned.sort((left, right) => right.createdAt - left.createdAt);
+        sanitized[promptId] = cleaned;
+      }
+    });
+    return sanitized;
+  }
+
+  function validateHistoryRecord(item) {
+    if (!item || typeof item !== 'object') return null;
+    if (typeof item.id !== 'string' || !isIsoString(item.at)) return null;
+    return {
+      id: item.id,
+      action: normalizeHistoryAction(item.action),
+      promptId: typeof item.promptId === 'string' ? item.promptId : null,
+      title: trim(item.title) || 'Untitled',
+      model: trim(item.model) || 'unknown',
+      at: item.at,
+      details: trim(item.details || '').slice(0, MAX_HISTORY_DETAIL_LENGTH)
+    };
+  }
+
+  function sanitizeHistory(candidate) {
+    if (!Array.isArray(candidate)) return [];
+    const sanitized = [];
+    const seen = new Set();
+    candidate.forEach(item => {
+      const validated = validateHistoryRecord(item);
+      if (!validated || seen.has(validated.id)) return;
+      seen.add(validated.id);
+      sanitized.push(validated);
+    });
+    sanitized.sort((left, right) => new Date(right.at) - new Date(left.at));
+    return sanitized.slice(0, MAX_HISTORY_ITEMS);
   }
 
   function buildExportPayload() {
     const prompts = loadPrompts();
     prompts.forEach(validatePromptRecord);
-
-    const stats = computeStats(prompts);
-
+    const notes = sanitizeNotesStore(cloneNotesStore(loadNotesStore()), new Set(prompts.map(prompt => prompt.id)));
+    const history = sanitizeHistory(loadHistory());
     return {
       type: 'prompt-library-export',
       version: EXPORT_SCHEMA_VERSION,
       exportedAt: new Date().toISOString(),
-      stats,
-      prompts
+      stats: computeStats(prompts, notes, history),
+      prompts,
+      notes,
+      history
     };
   }
 
-  function triggerDownload(obj) {
-    const json = JSON.stringify(obj, null, 2);
-    const blob = new Blob([json], { type: 'application/json' });
-    const ts = new Date().toISOString().replace(/[:.]/g,'-');
-    const a = document.createElement('a');
-    a.download = `${EXPORT_FILE_BASENAME}-${ts}.json`;
-    a.href = URL.createObjectURL(blob);
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  function triggerDownload(payload) {
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const anchor = document.createElement('a');
+    anchor.download = `${EXPORT_FILE_BASENAME}-${stamp}.json`;
+    anchor.href = URL.createObjectURL(blob);
+    document.body.appendChild(anchor);
+    anchor.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(anchor.href);
+      anchor.remove();
+    }, 1000);
   }
 
   function exportPrompts() {
     try {
       const payload = buildExportPayload();
       triggerDownload(payload);
-      showIEMessage(`Export completed: ${payload.prompts.length} prompt(s).`, 'success');
-    } catch (e) {
-      console.error(e);
-      showIEMessage('Export failed: '+(e.message||e), 'error');
+      showIEMessage(`Export completed: ${payload.prompts.length} prompt(s), ${payload.stats.totalNotes} note(s), ${payload.stats.totalHistoryEvents} history event(s).`, 'success');
+    } catch (error) {
+      console.error(error);
+      showIEMessage(`Export failed: ${error.message || error}`, 'error');
     }
   }
 
   function parseImportFile(text) {
+    if (typeof text !== 'string' || !text.trim()) throw new Error('Import file is empty.');
     let data;
     try {
       data = JSON.parse(text);
@@ -970,12 +1143,9 @@
 
     if (!data || typeof data !== 'object') throw new Error('Import root must be an object.');
 
-    // Support current schema and older variants.
     const version = Number(data.version ?? data.schemaVersion ?? 1);
     if (!Number.isFinite(version)) throw new Error('Missing or invalid export version.');
-    if (version > EXPORT_SCHEMA_VERSION) {
-      throw new Error(`Import version ${version} is newer than supported version ${EXPORT_SCHEMA_VERSION}.`);
-    }
+    if (version > EXPORT_SCHEMA_VERSION) throw new Error(`Import version ${version} is newer than supported version ${EXPORT_SCHEMA_VERSION}.`);
 
     let prompts = [];
     if (Array.isArray(data.prompts)) prompts = data.prompts;
@@ -984,131 +1154,264 @@
     else if (Array.isArray(data)) prompts = data;
     else throw new Error('Missing prompts array in import file.');
 
-    const hydrated = prompts.map(hydrateLegacyPrompt);
-    hydrated.forEach(validatePromptRecord);
-    assertPromptIdsUnique(hydrated);
+    const hydratedPrompts = prompts.map(hydrateLegacyPrompt);
+    if (hydratedPrompts.length > MAX_IMPORT_PROMPTS) throw new Error(`Import contains too many prompts. Limit is ${MAX_IMPORT_PROMPTS}.`);
+    hydratedPrompts.forEach(validatePromptRecord);
+    assertPromptIdsUnique(hydratedPrompts);
 
-    return { prompts: hydrated, version };
+    const promptIds = new Set(hydratedPrompts.map(prompt => prompt.id));
+    const notes = sanitizeNotesStore(data.notes || {}, promptIds);
+    const history = sanitizeHistory(data.history || []);
+
+    return {
+      version,
+      prompts: hydratedPrompts,
+      notes,
+      history
+    };
   }
 
   function mergePrompts(existing, incoming, overwriteConflicts) {
-    const map = new Map(existing.map(p => [p.id, p]));
+    const map = new Map(existing.map(prompt => [prompt.id, prompt]));
     let duplicateCount = 0;
-
-    for (const p of incoming) {
-      if (map.has(p.id)) {
+    incoming.forEach(prompt => {
+      if (map.has(prompt.id)) {
         duplicateCount += 1;
-        if (overwriteConflicts) map.set(p.id, p);
-      } else {
-        map.set(p.id, p);
+        if (overwriteConflicts) map.set(prompt.id, prompt);
+        return;
       }
-    }
-
+      map.set(prompt.id, prompt);
+    });
     return {
-      prompts: Array.from(map.values()).sort((a,b) => new Date(b.metadata?.createdAt||0) - new Date(a.metadata?.createdAt||0)),
+      prompts: Array.from(map.values()).sort((left, right) => new Date(right.metadata?.createdAt || 0) - new Date(left.metadata?.createdAt || 0)),
       duplicateCount
     };
   }
 
-  function chooseImportMode(incomingCount, duplicateCount) {
-    const replace = window.confirm(
-      `Import file contains ${incomingCount} prompt(s)${duplicateCount ? ` with ${duplicateCount} duplicate id(s).` : '.'}\n\n` +
-      'Click OK to REPLACE all existing prompts.\nClick Cancel to MERGE with existing prompts.'
-    );
-    return replace ? 'replace' : 'merge';
+  function mergeNotes(existing, incoming, overwriteConflicts, validPromptIds) {
+    const merged = cloneNotesStore(existing);
+    Object.entries(incoming).forEach(([promptId, notes]) => {
+      if (!validPromptIds.has(promptId) || !Array.isArray(notes)) return;
+      if (!Array.isArray(merged[promptId]) || overwriteConflicts) {
+        merged[promptId] = notes.slice();
+        return;
+      }
+      const seen = new Set(merged[promptId].map(note => note.id));
+      notes.forEach(note => {
+        if (!seen.has(note.id)) {
+          seen.add(note.id);
+          merged[promptId].push(note);
+        }
+      });
+      merged[promptId].sort((left, right) => right.createdAt - left.createdAt);
+    });
+    return sanitizeNotesStore(merged, validPromptIds);
+  }
+
+  function mergeHistory(existing, incoming) {
+    return sanitizeHistory([...existing, ...incoming]);
   }
 
   function backupCurrentData() {
-    try {
-      localStorage.setItem(STORAGE_KEY + '.backup', localStorage.getItem(STORAGE_KEY) || '[]');
-    } catch (e) {
-      console.warn('Failed to persist backup', e);
-    }
+    [STORAGE_KEY, NOTES_KEY, HISTORY_KEY].forEach(key => {
+      const value = localStorage.getItem(key);
+      localStorage.setItem(key + BACKUP_SUFFIX, value == null ? '' : value);
+    });
   }
 
   function rollbackFromBackup() {
+    [STORAGE_KEY, NOTES_KEY, HISTORY_KEY].forEach(key => {
+      const backup = localStorage.getItem(key + BACKUP_SUFFIX);
+      if (backup == null) return;
+      if (backup === '') localStorage.removeItem(key);
+      else localStorage.setItem(key, backup);
+    });
+    state.prompts = null;
+    state.notes = null;
+    state.history = null;
+  }
+
+  function updateImportModalVisibility() {
+    if (!duplicateOptions || !importModeMerge) return;
+    const hasDuplicates = Boolean(state.importDecisionContext?.duplicateCount);
+    duplicateOptions.hidden = !(importModeMerge.checked && hasDuplicates);
+  }
+
+  function resolveImportDecision(decision) {
+    const resolver = state.importDecisionResolver;
+    state.importDecisionResolver = null;
+    state.importDecisionContext = null;
+    if (importModal?.open) importModal.close();
+    if (resolver) resolver(decision);
+  }
+
+  function openImportDecisionModal(context) {
+    if (!importModal || !importModeReplace || !importModeMerge || !duplicateHandlingSelect) {
+      return Promise.resolve({ mode: 'replace', overwriteConflicts: true });
+    }
+    state.importDecisionContext = context;
+    importModeReplace.checked = true;
+    importModeMerge.checked = false;
+    duplicateHandlingSelect.value = 'overwrite';
+    updateImportModalVisibility();
+    if (importModalCopy) {
+      importModalCopy.textContent = `Import file contains ${context.incomingCount} prompt(s)${context.duplicateCount ? ` and ${context.duplicateCount} duplicate prompt id(s).` : '.'}`;
+    }
+    importModal.showModal();
+    return new Promise(resolve => {
+      state.importDecisionResolver = resolve;
+    });
+  }
+
+  async function importFile(file) {
+    if (!file) return;
+    const name = typeof file.name === 'string' ? file.name.toLowerCase() : '';
+    if (name && !name.endsWith('.json')) {
+      showIEMessage('Import failed: only .json files are supported.', 'error');
+      return;
+    }
+    if (typeof file.size === 'number' && file.size > MAX_IMPORT_FILE_SIZE_BYTES) {
+      showIEMessage(`Import failed: file is too large. Limit is ${Math.round(MAX_IMPORT_FILE_SIZE_BYTES / 1024)} KB.`, 'error');
+      return;
+    }
+    const text = await file.text();
     try {
-      const p = localStorage.getItem(STORAGE_KEY + '.backup');
-      if (p) localStorage.setItem(STORAGE_KEY, p);
-    } catch (e) {
-      console.error('Rollback failed', e);
+      backupCurrentData();
+      const existingPrompts = loadPrompts();
+      const existingNotes = loadNotesStore();
+      const existingHistory = loadHistory();
+      const parsed = parseImportFile(text);
+      const existingIds = new Set(existingPrompts.map(prompt => prompt.id));
+      const duplicateCount = parsed.prompts.reduce((count, prompt) => count + (existingIds.has(prompt.id) ? 1 : 0), 0);
+      const decision = await openImportDecisionModal({ incomingCount: parsed.prompts.length, duplicateCount });
+      if (!decision) {
+        showIEMessage('Import canceled.', 'success');
+        return;
+      }
+
+      let finalPrompts;
+      let finalNotes;
+      let finalHistory;
+      let details;
+
+      if (decision.mode === 'replace') {
+        finalPrompts = parsed.prompts;
+        finalNotes = parsed.notes;
+        finalHistory = parsed.history;
+        details = 'mode=replace';
+      } else {
+        const mergedPrompts = mergePrompts(existingPrompts, parsed.prompts, decision.overwriteConflicts);
+        finalPrompts = mergedPrompts.prompts;
+        const validPromptIds = new Set(finalPrompts.map(prompt => prompt.id));
+        finalNotes = mergeNotes(existingNotes, parsed.notes, decision.overwriteConflicts, validPromptIds);
+        finalHistory = mergeHistory(existingHistory, parsed.history);
+        details = `mode=merge, duplicates=${mergedPrompts.duplicateCount}, overwrite=${decision.overwriteConflicts}`;
+      }
+
+      savePrompts(finalPrompts);
+      saveNotesStore(finalNotes);
+      saveHistory(finalHistory);
+      appendHistoryEvent({
+        action: 'import',
+        title: 'Import completed',
+        model: 'mixed',
+        details: `${parsed.prompts.length} prompt(s) imported, ${details}`
+      });
+      scheduleRender(finalPrompts);
+      renderHistory(loadHistory(true));
+      showIEMessage(`Import successful (${decision.mode}). Loaded ${parsed.prompts.length} prompt(s).`, 'success');
+    } catch (error) {
+      console.error('Import error', error);
+      rollbackFromBackup();
+      scheduleRender(loadPrompts(true));
+      renderHistory(loadHistory(true));
+      showIEMessage(`Import failed and was rolled back: ${error.message || error}`, 'error');
     }
   }
 
-  function importFile(file) {
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const existingPrompts = loadPrompts();
-        backupCurrentData();
-
-        const { prompts: incomingPrompts } = parseImportFile(String(reader.result));
-        const existingIds = new Set(existingPrompts.map(p => p.id));
-        let duplicateCount = 0;
-        for (const p of incomingPrompts) {
-          if (existingIds.has(p.id)) duplicateCount += 1;
-        }
-
-        const mode = chooseImportMode(incomingPrompts.length, duplicateCount);
-
-        let finalPrompts = incomingPrompts;
-        let importDetails = '';
-
-        if (mode === 'merge') {
-          const overwriteConflicts = duplicateCount
-            ? window.confirm('Merge mode: overwrite duplicates with imported prompts?\nOK = overwrite duplicates, Cancel = keep existing duplicates.')
-            : false;
-          const merged = mergePrompts(existingPrompts, incomingPrompts, overwriteConflicts);
-          finalPrompts = merged.prompts;
-          importDetails = `mode=merge, duplicates=${merged.duplicateCount}, overwrite=${overwriteConflicts}`;
-        } else {
-          importDetails = 'mode=replace';
-        }
-
-        savePrompts(finalPrompts);
-        appendHistoryEvent({
-          action: 'import',
-          title: 'Import completed',
-          model: 'mixed',
-          details: `${incomingPrompts.length} prompt(s) imported, ${importDetails}`
-        });
-
-        render(finalPrompts);
-        showIEMessage(`Import successful (${mode}). Loaded ${incomingPrompts.length} prompt(s).`, 'success');
-      } catch (e) {
-        console.error('Import error', e);
-        rollbackFromBackup();
-        render(loadPrompts());
-        showIEMessage('Import failed and was rolled back: ' + (e.message || e), 'error');
-      }
-    };
-    reader.onerror = () => {
-      showIEMessage('Failed reading file.', 'error');
-    };
-    reader.readAsText(file);
-  }
-
-  function showIEMessage(msg, type) {
+  function showIEMessage(message, type) {
     const host = document.getElementById('import-export-messages');
     if (!host) return;
-    host.textContent = msg;
+    host.textContent = message;
     host.hidden = false;
-    host.className = 'iemessages ' + (type||'');
-    clearTimeout(showIEMessage._t);
-    showIEMessage._t = setTimeout(()=>{ host.hidden = true; }, 6000);
+    host.className = `iemessages ${type || ''}`;
+    clearTimeout(showIEMessage.timeoutId);
+    showIEMessage.timeoutId = setTimeout(() => {
+      host.hidden = true;
+    }, 6000);
+  }
+
+  function setupImportModal() {
+    if (!importModal || !importModalForm || !importCancelBtn) return;
+    importModeReplace?.addEventListener('change', updateImportModalVisibility);
+    importModeMerge?.addEventListener('change', updateImportModalVisibility);
+    duplicateHandlingSelect?.addEventListener('change', updateImportModalVisibility);
+    importCancelBtn.addEventListener('click', () => resolveImportDecision(null));
+    importModal.addEventListener('cancel', event => {
+      event.preventDefault();
+      resolveImportDecision(null);
+    });
+    importModalForm.addEventListener('submit', event => {
+      event.preventDefault();
+      resolveImportDecision({
+        mode: importModeMerge?.checked ? 'merge' : 'replace',
+        overwriteConflicts: duplicateHandlingSelect?.value !== 'keep'
+      });
+    });
   }
 
   function setupImportExport() {
-    const exportBtn = document.getElementById('export-btn');
-    const importBtn = document.getElementById('import-btn');
-    const fileInput = document.getElementById('import-file');
-    if (exportBtn) exportBtn.addEventListener('click', exportPrompts);
-    if (importBtn) importBtn.addEventListener('click', () => fileInput && fileInput.click());
-    if (fileInput) fileInput.addEventListener('change', (e) => {
-      const f = fileInput.files && fileInput.files[0];
-      if (f) importFile(f);
+    exportBtn?.addEventListener('click', exportPrompts);
+    importBtn?.addEventListener('click', () => fileInput?.click());
+    fileInput?.addEventListener('change', async () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (file) await importFile(file);
       fileInput.value = '';
     });
   }
+
+  function wireFilters() {
+    searchInput?.addEventListener('input', event => {
+      state.searchQuery = trim(event.target.value);
+      scheduleRender();
+    });
+    filterModelSelect?.addEventListener('change', event => {
+      state.modelFilter = event.target.value;
+      scheduleRender();
+    });
+    clearFiltersBtn?.addEventListener('click', () => {
+      state.searchQuery = '';
+      state.modelFilter = '';
+      if (searchInput) searchInput.value = '';
+      if (filterModelSelect) filterModelSelect.value = '';
+      scheduleRender();
+    });
+  }
+
+  function init() {
+    form.addEventListener('submit', handleSubmit);
+    modelSelectInput?.addEventListener('change', () => {
+      updateModelInputState();
+      if (modelSelectInput.value === 'custom') modelCustomInput.focus();
+    });
+    savedTabBtn?.addEventListener('click', () => setActiveTab('saved'));
+    historyTabBtn?.addEventListener('click', () => setActiveTab('history'));
+    clearHistoryBtn?.addEventListener('click', () => {
+      if (!window.confirm('Clear all history entries?')) return;
+      saveHistory([]);
+      renderHistory([]);
+    });
+
+    wireFilters();
+    setupImportModal();
+    setupImportExport();
+    updateModelInputState();
+
+    const prompts = loadPrompts();
+    render(prompts);
+    renderHistory(reconcileHistoryWithPrompts(prompts));
+    setActiveTab('saved');
+  }
+
+  document.addEventListener('DOMContentLoaded', init);
 })();
