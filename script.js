@@ -1,17 +1,26 @@
 (function() {
   const STORAGE_KEY = 'promptLibrary.items.v1';
   const NOTES_KEY = 'promptNotes.v1'; // localStorage key for notes
-  const META_VERSION = 'v1';
+  const HISTORY_KEY = 'promptHistory.v1';
+  const MAX_HISTORY_ITEMS = 500;
 
   const form = document.getElementById('prompt-form');
   const titleInput = document.getElementById('prompt-title');
   const contentInput = document.getElementById('prompt-content');
-  const modelInput = document.getElementById('model-name');
+  const modelSelectInput = document.getElementById('model-select');
+  const modelCustomInput = document.getElementById('model-custom');
   const errorEl = document.getElementById('form-error');
   const listEl = document.getElementById('prompts-list');
   const emptyEl = document.getElementById('prompts-empty');
   const countEl = document.getElementById('prompt-count');
   const cardTemplate = document.getElementById('prompt-card-template');
+  const savedTabBtn = document.getElementById('tab-saved');
+  const historyTabBtn = document.getElementById('tab-history');
+  const savedPanelEl = document.getElementById('panel-saved');
+  const historyPanelEl = document.getElementById('panel-history');
+  const historyListEl = document.getElementById('history-list');
+  const historyEmptyEl = document.getElementById('history-empty');
+  const clearHistoryBtn = document.getElementById('clear-history-btn');
 
   function loadPrompts() {
     try {
@@ -65,6 +74,23 @@
 
   function trim(str) { return (str || '').trim(); }
 
+  function getSelectedModel() {
+    if (!modelSelectInput) return '';
+    if (modelSelectInput.value === 'custom') {
+      return trim(modelCustomInput?.value || '');
+    }
+    return trim(modelSelectInput.value);
+  }
+
+  function updateModelInputState() {
+    if (!modelSelectInput || !modelCustomInput) return;
+    const isCustom = modelSelectInput.value === 'custom';
+    modelCustomInput.hidden = !isCustom;
+    modelCustomInput.setAttribute('aria-hidden', String(!isCustom));
+    modelCustomInput.required = isCustom;
+    if (!isCustom) modelCustomInput.value = '';
+  }
+
   function render(prompts) {
     listEl.innerHTML = '';
 
@@ -107,15 +133,120 @@
   }
 
   function preview(text) {
-    const words = trim(text).split(/\s+/).slice(0, 12);
-    const joined = words.join(' ');
-    return joined + (trim(text).split(/\s+/).length > words.length ? ' …' : '');
+    return trim(text);
   }
 
   function deletePrompt(id) {
+    const prompt = loadPrompts().find(p => p.id === id);
+    const shouldDelete = window.confirm('Are you sure you want to delete this prompt?');
+    if (!shouldDelete) return;
     const prompts = loadPrompts().filter(p => p.id !== id);
     savePrompts(prompts);
+    if (prompt) {
+      appendHistoryEvent({
+        action: 'delete',
+        promptId: prompt.id,
+        title: prompt.title,
+        model: prompt?.metadata?.model || 'unknown'
+      });
+    }
     render(prompts);
+  }
+
+  function loadHistory() {
+    try {
+      const raw = localStorage.getItem(HISTORY_KEY);
+      if (!raw) return [];
+      const data = JSON.parse(raw);
+      if (!Array.isArray(data)) return [];
+      return data.filter(item => item && typeof item.id === 'string' && typeof item.action === 'string' && typeof item.at === 'string');
+    } catch (e) {
+      console.warn('Failed to parse history store', e);
+      return [];
+    }
+  }
+
+  function saveHistory(history) {
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+    } catch (e) {
+      console.error('Failed to save history', e);
+    }
+  }
+
+  function createHistoryId() {
+    return 'h_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 9);
+  }
+
+  function appendHistoryEvent(event) {
+    const history = loadHistory();
+    history.unshift({
+      id: createHistoryId(),
+      action: event.action,
+      promptId: event.promptId || null,
+      title: event.title || 'Untitled',
+      model: event.model || 'unknown',
+      at: new Date().toISOString(),
+      details: event.details || ''
+    });
+    if (history.length > MAX_HISTORY_ITEMS) history.length = MAX_HISTORY_ITEMS;
+    saveHistory(history);
+    renderHistory(history);
+  }
+
+  function renderHistory(history) {
+    if (!historyListEl || !historyEmptyEl) return;
+    historyListEl.innerHTML = '';
+    if (!history.length) {
+      historyEmptyEl.hidden = false;
+      return;
+    }
+    historyEmptyEl.hidden = true;
+    const frag = document.createDocumentFragment();
+    history.forEach(item => {
+      const li = document.createElement('li');
+      li.className = 'history-item';
+      li.dataset.action = item.action;
+      const when = formatHistoryTs(item.at);
+      li.innerHTML = `
+        <div class="history-item-header">
+          <p class="history-item-title">${escapeHtml(item.title)}</p>
+          <time class="history-item-time" datetime="${item.at}">${when}</time>
+        </div>
+        <p class="history-item-meta">
+          <span class="history-action ${item.action}">${item.action}</span>
+          · Model: ${escapeHtml(item.model || 'unknown')}
+          ${item.details ? `· ${escapeHtml(item.details)}` : ''}
+        </p>
+      `;
+      frag.appendChild(li);
+    });
+    historyListEl.appendChild(frag);
+  }
+
+  function formatHistoryTs(iso) {
+    try {
+      return new Date(iso).toLocaleString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+    } catch {
+      return iso;
+    }
+  }
+
+  function setActiveTab(tab) {
+    const isSaved = tab === 'saved';
+    if (!savedTabBtn || !historyTabBtn || !savedPanelEl || !historyPanelEl) return;
+    savedTabBtn.classList.toggle('is-active', isSaved);
+    historyTabBtn.classList.toggle('is-active', !isSaved);
+    savedTabBtn.setAttribute('aria-selected', String(isSaved));
+    historyTabBtn.setAttribute('aria-selected', String(!isSaved));
+    savedPanelEl.hidden = !isSaved;
+    historyPanelEl.hidden = isSaved;
+    if (!isSaved) renderHistory(loadHistory());
   }
 
   /* Rating Logic */
@@ -236,7 +367,7 @@
 
     const title = trim(titleInput.value);
     const content = trim(contentInput.value);
-  const modelName = trim(modelInput.value);
+    const modelName = getSelectedModel();
 
     if (!title) {
       errorEl.textContent = 'Title is required.';
@@ -249,8 +380,12 @@
       return;
     }
     if (!modelName) {
-      errorEl.textContent = 'Model is required.';
-      modelInput.focus();
+      errorEl.textContent = 'Model is required. Choose one or type a custom model.';
+      if (modelSelectInput && modelSelectInput.value === 'custom') {
+        modelCustomInput.focus();
+      } else {
+        modelSelectInput.focus();
+      }
       return;
     }
 
@@ -263,17 +398,44 @@
     }
 
     const prompts = loadPrompts();
-    prompts.unshift({ id: createId(), title, content, metadata });
+    const newPrompt = { id: createId(), title, content, metadata };
+    prompts.unshift(newPrompt);
     savePrompts(prompts);
+    appendHistoryEvent({
+      action: 'save',
+      promptId: newPrompt.id,
+      title: newPrompt.title,
+      model: newPrompt.metadata.model
+    });
     render(prompts);
 
     form.reset();
+    if (modelSelectInput) modelSelectInput.value = 'gpt-4.1';
+    updateModelInputState();
     titleInput.focus();
   }
 
   function init() {
     form.addEventListener('submit', handleSubmit);
+    if (modelSelectInput) {
+      modelSelectInput.addEventListener('change', () => {
+        updateModelInputState();
+        if (modelSelectInput.value === 'custom') modelCustomInput.focus();
+      });
+    }
+    if (savedTabBtn) savedTabBtn.addEventListener('click', () => setActiveTab('saved'));
+    if (historyTabBtn) historyTabBtn.addEventListener('click', () => setActiveTab('history'));
+    if (clearHistoryBtn) {
+      clearHistoryBtn.addEventListener('click', () => {
+        if (!window.confirm('Clear all history entries?')) return;
+        saveHistory([]);
+        renderHistory([]);
+      });
+    }
     render(loadPrompts());
+    renderHistory(loadHistory());
+    setActiveTab('saved');
+    updateModelInputState();
     setupImportExport();
   }
 
@@ -566,22 +728,27 @@
   /** Estimate tokens from text */
   function estimateTokens(text, isCode) {
     if (typeof text !== 'string') throw new Error('estimateTokens: text must be a string');
+    if (typeof isCode !== 'boolean') throw new Error('estimateTokens: isCode must be a boolean');
     const words = text.trim() ? text.trim().split(/\s+/).length : 0;
     const chars = text.length;
-    let min = Math.round(0.75 * words);
-    let max = Math.round(0.25 * chars);
+    let min = 0.75 * words;
+    let max = 0.25 * chars;
     if (isCode) {
-      min = Math.round(min * 1.3);
-      max = Math.round(max * 1.3);
+      min = min * 1.3;
+      max = max * 1.3;
     }
     if (min > max) { // ensure ordering
       const tmp = min; min = max; max = tmp;
     }
-    const span = Math.max(min, max);
+    const span = max;
     let confidence = 'high';
     if (span >= 1000 && span <= 5000) confidence = 'medium';
     else if (span > 5000) confidence = 'low';
-    return { min, max, confidence };
+    return {
+      min: Number(min.toFixed(2)),
+      max: Number(max.toFixed(2)),
+      confidence
+    };
   }
 
   /** Create metadata for a model & content */
@@ -594,7 +761,7 @@
     if (typeof content !== 'string') throw new Error('trackModel: content must be a string');
     const createdAt = new Date().toISOString();
     const tokenEstimate = estimateTokens(content, looksLikeCode(content));
-    const meta = { model, createdAt, updatedAt: createdAt, tokenEstimate, _v: META_VERSION };
+    const meta = { model, createdAt, updatedAt: createdAt, tokenEstimate };
     validateMetadata(meta);
     return meta;
   }
@@ -649,20 +816,24 @@
 
     const row2 = document.createElement('div');
     row2.className = 'prompt-meta-row';
+    const createdLabel = document.createElement('span');
+    createdLabel.className = 'meta-label';
+    createdLabel.textContent = 'Created:';
     const created = document.createElement('time');
     created.dateTime = meta.createdAt;
     created.title = 'Created';
     created.textContent = humanTime(meta.createdAt);
+    const updatedLabel = document.createElement('span');
+    updatedLabel.className = 'meta-label';
+    updatedLabel.textContent = 'Updated:';
     const updated = document.createElement('time');
     updated.dateTime = meta.updatedAt;
     updated.title = 'Updated';
     updated.textContent = humanTime(meta.updatedAt);
+    row2.appendChild(createdLabel);
     row2.appendChild(created);
-    if (meta.updatedAt !== meta.createdAt) {
-      const sep = document.createElement('span'); sep.textContent = '→'; sep.style.opacity = '.5';
-      row2.appendChild(sep);
-      row2.appendChild(updated);
-    }
+    row2.appendChild(updatedLabel);
+    row2.appendChild(updated);
     wrap.appendChild(row1);
     wrap.appendChild(row2);
     return wrap;
@@ -889,6 +1060,12 @@
         }
         savePrompts(mergedPrompts);
         saveNotesStore(finalNotes);
+        appendHistoryEvent({
+          action: 'import',
+          title: 'Import completed',
+          model: 'mixed',
+          details: `${incomingPrompts.length} prompt(s) imported`
+        });
         render(mergedPrompts);
         showIEMessage(`Import successful. Added ${incomingPrompts.length} prompt(s).`, 'success');
       } catch (e) {

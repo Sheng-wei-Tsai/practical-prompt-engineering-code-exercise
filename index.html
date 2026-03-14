@@ -26,9 +26,22 @@
           <p class="field-hint" id="title-hint">Required. Max 120 characters.</p>
         </div>
         <div class="field-group">
-          <label for="model-name">Model</label>
-          <input type="text" id="model-name" name="model" placeholder="e.g. gpt-4o-mini" maxlength="100" required />
-          <p class="field-hint" id="model-hint">Required. Model identifier (max 100 chars).</p>
+          <label for="model-select">Model</label>
+          <select id="model-select" name="model-select" aria-describedby="model-hint" required>
+            <option value="gpt-4.1" selected>OpenAI GPT-4.1</option>
+            <option value="gpt-4o">OpenAI GPT-4o</option>
+            <option value="gpt-4o-mini">OpenAI GPT-4o mini</option>
+            <option value="o3-mini">OpenAI o3-mini</option>
+            <option value="claude-3.7-sonnet">Anthropic Claude 3.7 Sonnet</option>
+            <option value="gemini-2.0-flash">Google Gemini 2.0 Flash</option>
+            <option value="gemini-1.5-pro">Google Gemini 1.5 Pro</option>
+            <option value="deepseek-r1">DeepSeek R1</option>
+            <option value="llama-3.3-70b">Meta Llama 3.3 70B</option>
+            <option value="mistral-large-2">Mistral Large 2</option>
+            <option value="custom">Other (type your own)</option>
+          </select>
+          <input type="text" id="model-custom" name="model-custom" placeholder="Type a custom model name" maxlength="100" hidden aria-hidden="true" />
+          <p class="field-hint" id="model-hint">Choose a popular model, or pick Other and type a custom model name.</p>
         </div>
         <div class="field-group">
           <label for="prompt-content">Content</label>
@@ -47,23 +60,42 @@
         <h2 id="saved-prompts-heading" class="panel-title">Saved Prompts</h2>
         <span id="prompt-count" class="count-badge" aria-live="polite"></span>
       </div>
-      <div id="import-export-messages" class="iemessages" role="alert" aria-live="polite" hidden></div>
-      <div id="prompts-empty" class="empty-state" hidden>
-        <p>No prompts saved yet. Add your first one!</p>
+      <div class="panel-tabs" role="tablist" aria-label="Prompt library tabs">
+        <button type="button" id="tab-saved" class="tab-btn is-active" role="tab" aria-selected="true" aria-controls="panel-saved">Saved</button>
+        <button type="button" id="tab-history" class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-history">History</button>
       </div>
-      <div id="prompts-list" class="cards" aria-live="polite"></div>
+      <div id="import-export-messages" class="iemessages" role="alert" aria-live="polite" hidden></div>
+      <div id="panel-saved" class="tab-panel" role="tabpanel" aria-labelledby="tab-saved">
+        <div id="prompts-empty" class="empty-state" hidden>
+          <p>No prompts saved yet. Add your first one!</p>
+        </div>
+        <div id="prompts-list" class="cards" aria-live="polite"></div>
+      </div>
+      <div id="panel-history" class="tab-panel" role="tabpanel" aria-labelledby="tab-history" hidden>
+        <div class="history-toolbar">
+          <p class="history-subtitle">Review all prompt save, import, and delete activity.</p>
+          <button type="button" id="clear-history-btn" class="history-clear-btn">Clear History</button>
+        </div>
+        <div id="history-empty" class="empty-state" hidden>
+          <p>No history yet. Save or delete prompts to create an activity log.</p>
+        </div>
+        <ul id="history-list" class="history-list" aria-live="polite"></ul>
+      </div>
     </section>
   </main>
 
   <template id="prompt-card-template">
     <article class="card" data-id="">
       <div class="card-main">
-        <h3 class="card-title"></h3>
+        <div class="card-header">
+          <h3 class="card-title"></h3>
+          <button class="delete-btn icon-btn" type="button" aria-label="Delete prompt" title="Delete prompt">
+            <span class="delete-icon" aria-hidden="true">&#128465;</span>
+            <span class="visually-hidden">Delete</span>
+          </button>
+        </div>
         <p class="card-preview"></p>
         <div class="prompt-meta" data-role="metadata"></div>
-      </div>
-      <div class="card-actions">
-        <button class="delete-btn" type="button" aria-label="Delete prompt">Delete</button>
       </div>
     </article>
   </template>
